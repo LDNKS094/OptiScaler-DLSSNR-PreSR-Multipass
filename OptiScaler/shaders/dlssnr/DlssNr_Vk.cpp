@@ -7,6 +7,8 @@
 #include "precompile/dlssnr_finished_color_Shader_Vk.h"
 #include "precompile/dlssnr_spatial_Shader_Vk.h"
 #include "precompile/dlssnr_spatial_guides_Shader_Vk.h"
+#include "precompile/dlssnr_raw_residual_Shader_Vk.h"
+#include "precompile/dlssnr_reapply_Shader_Vk.h"
 #include <dlssnr/DlssNrFinished_Vk.h>
 
 #include <algorithm>
@@ -129,6 +131,10 @@ DlssNr_Vk::~DlssNr_Vk()
         vkDestroyPipeline(_device, _spatialPipeline, nullptr);
     if (_spatialGuidesPipeline)
         vkDestroyPipeline(_device, _spatialGuidesPipeline, nullptr);
+    if (_rawResidualPipeline)
+        vkDestroyPipeline(_device, _rawResidualPipeline, nullptr);
+    if (_reapplyPipeline)
+        vkDestroyPipeline(_device, _reapplyPipeline, nullptr);
     _dummy.Destroy(_device);
 }
 
@@ -207,6 +213,28 @@ bool DlssNr_Vk::Dispatch(VkCommandBuffer InCmdList, const DlssNrConstants& InCon
     if (!CanRender() || InCmdList == VK_NULL_HANDLE || (finishedColor && !_finishedPipeline))
         return false;
 
+    auto pipeline = finishedColor ? _finishedPipeline : _pipeline;
+    if (InConstants.Mode == DlssNrMode_RawResidual)
+    {
+        if (!_rawResidualPipeline)
+        {
+            std::vector<char> code(dlssnr_raw_residual_spv, dlssnr_raw_residual_spv + sizeof(dlssnr_raw_residual_spv));
+            if (!CreateComputePipeline(_device, _pipelineLayout, &_rawResidualPipeline, code))
+                return false;
+        }
+        pipeline = _rawResidualPipeline;
+    }
+    else if (InConstants.Mode == DlssNrMode_Reapply)
+    {
+        if (!_reapplyPipeline)
+        {
+            std::vector<char> code(dlssnr_reapply_spv, dlssnr_reapply_spv + sizeof(dlssnr_reapply_spv));
+            if (!CreateComputePipeline(_device, _pipelineLayout, &_reapplyPipeline, code))
+                return false;
+        }
+        pipeline = _reapplyPipeline;
+    }
+
     if (InTarget == VK_NULL_HANDLE)
     {
         LOG_ERROR("DLSS-NR Vulkan pass: a dispatch with nothing to write");
@@ -230,7 +258,7 @@ bool DlssNr_Vk::Dispatch(VkCommandBuffer InCmdList, const DlssNrConstants& InCon
             *immutableSlot = slot;
     }
 
-    vkCmdBindPipeline(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, finishedColor ? _finishedPipeline : _pipeline);
+    vkCmdBindPipeline(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _pipelineLayout, 0, 1, &_descriptorSets[slot], 0,
                             nullptr);
 

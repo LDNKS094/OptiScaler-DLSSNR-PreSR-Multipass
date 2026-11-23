@@ -31,7 +31,9 @@ enum DlssNrMode : uint32_t
     DlssNrMode_AutoExposure = 11,
     DlssNrMode_ResizePrivateGuides = 10,
     DlssNrMode_EncodeResizeField = 12,
-    DlssNrMode_SuppressHalo = 13
+    DlssNrMode_SuppressHalo = 13,
+    DlssNrMode_RawResidual = 130, // Reconstruct an encoded intermediate without final scene composition.
+    DlssNrMode_Reapply = 131      // Repeat the last model pass's change: WhitePoint carries the run's total gain.
 };
 
 inline bool DlssNrUsesDlssEnlargement(uint32_t transfer) { return transfer == 2 || transfer == 4; }

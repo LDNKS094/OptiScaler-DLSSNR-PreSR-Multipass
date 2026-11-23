@@ -1,5 +1,9 @@
 > **v0.8.91 prerelease:** [compressed model input preview](docs/RELEASE-v0.8.91.md).
 
+## Standalone Display Filter
+
+The [Display Filter source and build instructions](standalone/NrCapture/README.md) are in `standalone/NrCapture`. This Windows application applies neural rendering to a captured screen or window.
+
 <div align="center">
 
   ![Logo](https://github.com/user-attachments/assets/c7dad5da-0b29-4710-8a57-b58e4e407abd)
@@ -47,6 +51,10 @@ model resolution, HDR/exposure controls and separate edit upscaling. It defaults
 uses a separately supplied `nvngx_dlssnr.dll` through the NVIDIA driver; no NR helper DLL.
 
 Optional [peripheral spatial compression](docs/NR-SPATIAL-COMPRESSION.md) reduces NR work near the screen edges while retaining more centre detail. It supports DX12 and native Vulkan and combines with Model resolution.
+
+**Edit pass → Resolution and upscaling** adds optional independent scale, reconstruction, private upscaler
+and peripheral-compression settings for each NR pass. Unset profiles inherit pass 1; final HDR/strength/skin
+composition still runs once. See [per-pass controls and validation limits](OptiScaler/dlssnr/README.md#independent-resolution-and-upscaling-per-pass).
 
 See [installation](INSTALL-DLSSNR.md), [controls](docs/NR-PIPELINE-UI.md),
 [game tests and limits](docs/NR-UPSTREAM-REVIEW.md), [implementation](OptiScaler/dlssnr/README.md)

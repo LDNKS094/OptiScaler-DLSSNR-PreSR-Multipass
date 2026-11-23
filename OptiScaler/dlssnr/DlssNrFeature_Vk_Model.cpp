@@ -24,6 +24,14 @@
 namespace DlssNr
 {
 
+ModelVk::Impl::Impl(DlssNr_Vk& shader) { state.pass = &shader; }
+
+ModelVk::Impl::~Impl()
+{
+    Shutdown();
+    ClearStatus(this);
+}
+
 void ModelVk::Impl::Fail(const char* why)
 {
     if (state.failed)
@@ -171,6 +179,7 @@ void ModelVk::Impl::Shutdown()
     if (state.device != VK_NULL_HANDLE)
         vkDeviceWaitIdle(state.device);
 
+    ReleaseIndependent();
     ReleaseModels();
     state.activePasses = 0;
     if (state.creationReady != VK_NULL_HANDLE)
@@ -229,9 +238,8 @@ void ModelVk::Impl::Shutdown()
 
 bool ModelVk::Impl::PrepareModels(VkCommandBuffer cmdBuffer, const DlssNrFrameInfo_Vk& frame, uint32_t width,
                                   uint32_t height, uint32_t workWidth, uint32_t workHeight, float workScale,
-                                  unsigned int passes, const Spatial::Layout& spatial)
+                                  unsigned int passes, const Spatial::Layout& spatial, const Config& cfg)
 {
-    auto& cfg = *Config::Instance();
     const auto instance = state.instance;
     const auto physicalDevice = state.physicalDevice;
     const auto device = state.device;
@@ -281,9 +289,15 @@ bool ModelVk::Impl::PrepareModels(VkCommandBuffer cmdBuffer, const DlssNrFrameIn
 
     // Resize. The feature is built for a size and has to be rebuilt when the frame OR the working
     // size changes -- moving the slider is a rebuild, which is why it is compared here.
+    // A re-applying pass has no feature; its sentinel profile (never a valid one) makes toggling it a rebuild.
+    const auto builtProfile = [&](unsigned int pass)
+    {
+        return Profiles::PassReapplies(cfg, pass) ? ModelSettings { .intensity = -1.0f }
+                                                  : Profiles::PassSettings(cfg, pass);
+    };
     bool profileChanged = state.activePasses != passes;
     for (unsigned int pass = 0; pass < passes; ++pass)
-        profileChanged |= state.builtSettings[pass] != Profiles::PassSettings(cfg, pass);
+        profileChanged |= state.builtSettings[pass] != builtProfile(pass);
     if (state.width != width || state.height != height || state.workWidth != workWidth ||
         state.workHeight != workHeight || state.beforeSr != beforeSr || state.rayReconstruction != rayReconstruction ||
         profileChanged || ((state.spatialLayout.requested || spatial.requested) && state.spatialLayout != spatial))
@@ -363,7 +377,7 @@ bool ModelVk::Impl::PrepareModels(VkCommandBuffer cmdBuffer, const DlssNrFrameIn
         state.activePasses = passes;
         state.spatialLayout = spatial;
         for (unsigned int pass = 0; pass < passes; ++pass)
-            state.builtSettings[pass] = Profiles::PassSettings(cfg, pass);
+            state.builtSettings[pass] = builtProfile(pass);
         state.reset = true;
     }
 
@@ -379,7 +393,7 @@ bool ModelVk::Impl::PrepareModels(VkCommandBuffer cmdBuffer, const DlssNrFrameIn
     bool created = false;
     for (unsigned int pass = 0; pass < passes; ++pass)
     {
-        if (state.models[pass].feature)
+        if (state.models[pass].feature || Profiles::PassReapplies(cfg, pass))
             continue;
         if (!CreateModel(cmdBuffer, pass, workWidth, workHeight, cfg))
         {

@@ -325,8 +325,22 @@ class Config
         CustomOptional<uint32_t, NoDefault> preset, style;
         CustomOptional<float, NoDefault> intensity, structure, tone, skin;
         CustomOptional<bool, NoDefault> autoMask;
+        // Optional resolution/reconstruction profile, independent of model tuning.
+        CustomOptional<float, NoDefault> workingScale;
+        CustomOptional<Scaler, NoDefault> scalingDownscaler;
+        CustomOptional<uint32_t, NoDefault> transfer;
+        CustomOptional<int, NoDefault> privateUpscaler;
+        CustomOptional<bool, NoDefault> spatialCompression;
+        CustomOptional<float, NoDefault> spatialCenterX, spatialCenterY, spatialWorkX, spatialWorkY;
+        CustomOptional<float, NoDefault> spatialOffsetX, spatialOffsetY, spatialShiftX, spatialShiftY;
+        // Reapply: skip the network and repeat the last network pass's change. Borrow*: run the network but take
+        // the transformer, or every block at 1/borrowLevel size and below, from the frame's first evaluation.
+        CustomOptional<bool, NoDefault> reapply, borrowTransformer, borrowBelow;
+        CustomOptional<uint32_t, NoDefault> borrowLevel;
     };
     NrPassOverrides DlssNrPassOverrides[29]; // Existing Pass2..Pass30 INI keys remain unchanged.
+    // Gain of each re-applied pass: out = saturate(out_m + r*gain*(out_m - in_m)) for r re-applied passes.
+    CustomOptional<float> DlssNrReapplyGain { 0.81f };
 
     // Composition strengths are separate from model creation settings.
     CustomOptional<float> DlssNrTransferStrength { 1.0f };
@@ -358,6 +372,10 @@ class Config
     CustomOptional<float> DlssNrCompareZoom { 1.0f };
 
     CustomOptional<bool> DlssNrCompareSwap { false };
+
+    // What a comparison puts beside the NR picture: 0 the original picture, otherwise an NR model (a Preset value):
+    // one pass of that model with pass 1's settings.
+    CustomOptional<uint32_t> DlssNrCompareModel { 0 };
 
     CustomOptional<bool> DlssNrCompareTags { false };
     CustomOptional<float> DlssNrTagScale { 1.5f };

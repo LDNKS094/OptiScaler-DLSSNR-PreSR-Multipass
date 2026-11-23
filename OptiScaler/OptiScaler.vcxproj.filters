@@ -1647,6 +1647,9 @@
     <ClInclude Include="dlssnr\DlssNr_HoldParameters_Dx12.h"><Filter>Header Files</Filter></ClInclude>
     <ClCompile Include="dlssnr\DlssNr_Menu.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="dlssnr\DlssNr_MenuControls.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="dlssnr\DlssNr_MenuPresets.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="dlssnr\DlssNr_Presets.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="dlssnr\DlssNr_Calibrate.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="dlssnr\DlssNr_MenuOverlay.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClInclude Include="dlssnr\DlssNr_MenuOverlay.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="dlssnr\DlssNr_MenuSections.h"><Filter>Header Files</Filter></ClInclude>
@@ -1701,6 +1704,11 @@
     <ClCompile Include="dlssnr\DlssNr_CompatibilityRuntimePaths.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClInclude Include="dlssnr\DlssNr_CompatibilityRuntime.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="dlssnr\DlssNr_RuntimeImports.h"><Filter>Header Files</Filter></ClInclude>
+    <ClCompile Include="dlssnr\NrPassBorrow.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClInclude Include="dlssnr\NrPassBorrow.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="dlssnr\NrPassBorrowCopy.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="dlssnr\NrPassBorrowTables.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="dlssnr\NrPassBorrowTest.h"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dlssnr\DlssNrFeature_Vk_Resources.cpp"><Filter>Source Files</Filter></ClCompile>

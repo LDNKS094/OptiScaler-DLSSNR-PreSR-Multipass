@@ -269,7 +269,7 @@ copy "$(SolutionDir)external\directx_agility_sdk\LICENSE.txt" $(SolutionDir)x64\
 copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y</Command>
     </PostBuildEvent>
     <PreBuildEvent>
-      <Command>powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $date = Get-Date -Format 'yyyyMMdd_HHmmss'; $commit = (git -C '$(SolutionDir)' rev-parse --short HEAD 2&gt;$null); if (-not $commit) { $commit = 'unknown' }; function Write-Retry([string]$path, [string]$value) { for ($i = 0; $i -lt 30; $i++) { try { [System.IO.File]::WriteAllText($path, $value + [Environment]::NewLine, [System.Text.Encoding]::ASCII); return } catch [System.IO.IOException] { if ($i -eq 29) { throw }; Start-Sleep -Milliseconds 100 } } }; Write-Retry '$(ProjectDir)resource_build_date.h' ('#define VER_BUILD_DATE \"' + $date + '\"'); Write-Retry '$(ProjectDir)resource_build_commit.h' ('#define VER_BUILD_COMMIT \"' + $commit + '\"');"</Command>
+      <Command>powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $date = Get-Date -Format 'yyyyMMdd_HHmmss'; $commit = (git -C '$(SolutionDir).' rev-parse --short HEAD 2&gt;$null); if (-not $commit) { $commit = 'unknown' }; function Write-Retry([string]$path, [string]$value) { for ($i = 0; $i -lt 30; $i++) { try { [System.IO.File]::WriteAllText($path, $value + [Environment]::NewLine, [System.Text.Encoding]::ASCII); return } catch [System.IO.IOException] { if ($i -eq 29) { throw }; Start-Sleep -Milliseconds 100 } } }; Write-Retry '$(ProjectDir)resource_build_date.h' ('#define VER_BUILD_DATE \"' + $date + '\"'); Write-Retry '$(ProjectDir)resource_build_commit.h' ('#define VER_BUILD_COMMIT \"' + $commit + '\"');"</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseDebug|x64'">
@@ -301,7 +301,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
       <Command>powershell -Command "$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'; $fileName = '$(OutDir)OptiScaler_' + $timestamp + '.7z'; $backupFileName = '$(OutDir)OptiScaler_' + $timestamp + '_Backup.7z'; &amp; '7z.exe' a -t7z $fileName '$(TargetPath)'; &amp; '7z.exe' a -t7z $backupFileName '$(OutDir)$(TargetName).*'"</Command>
     </PostBuildEvent>
     <PreBuildEvent>
-      <Command>powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $date = Get-Date -Format 'yyyyMMdd_HHmmss'; $commit = (git -C '$(SolutionDir)' rev-parse --short HEAD 2&gt;$null); if (-not $commit) { $commit = 'unknown' }; function Write-Retry([string]$path, [string]$value) { for ($i = 0; $i -lt 30; $i++) { try { [System.IO.File]::WriteAllText($path, $value + [Environment]::NewLine, [System.Text.Encoding]::ASCII); return } catch [System.IO.IOException] { if ($i -eq 29) { throw }; Start-Sleep -Milliseconds 100 } } }; Write-Retry '$(ProjectDir)resource_build_date.h' ('#define VER_BUILD_DATE \"' + $date + '\"'); Write-Retry '$(ProjectDir)resource_build_commit.h' ('#define VER_BUILD_COMMIT \"' + $commit + '\"');"</Command>
+      <Command>powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $date = Get-Date -Format 'yyyyMMdd_HHmmss'; $commit = (git -C '$(SolutionDir).' rev-parse --short HEAD 2&gt;$null); if (-not $commit) { $commit = 'unknown' }; function Write-Retry([string]$path, [string]$value) { for ($i = 0; $i -lt 30; $i++) { try { [System.IO.File]::WriteAllText($path, $value + [Environment]::NewLine, [System.Text.Encoding]::ASCII); return } catch [System.IO.IOException] { if ($i -eq 29) { throw }; Start-Sleep -Milliseconds 100 } } }; Write-Retry '$(ProjectDir)resource_build_date.h' ('#define VER_BUILD_DATE \"' + $date + '\"'); Write-Retry '$(ProjectDir)resource_build_commit.h' ('#define VER_BUILD_COMMIT \"' + $commit + '\"');"</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <PropertyGroup>
@@ -325,6 +325,38 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="dlssnr\DlssNr_CompatibilityRuntimePaths.cpp" />
     <ClInclude Include="dlssnr\DlssNr_CompatibilityRuntime.h" />
     <ClInclude Include="dlssnr\DlssNr_RuntimeImports.h" />
+    <ClCompile Include="dlssnr\NrPassBorrow.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClInclude Include="dlssnr\NrPassBorrow.h" />
+    <ClInclude Include="dlssnr\NrPassBorrowCopy.h" />
+    <ClInclude Include="dlssnr\NrPassBorrowTables.h" />
+    <ClInclude Include="dlssnr\NrPassBorrowTest.h" />
+    <ClCompile Include="dlssnr\NrNvfp4.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <PreprocessorDefinitions>NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClInclude Include="dlssnr\NrNvfp4.h" />
+    <ClCompile Include="..\standalone\NrCapture\nvfp4\NrFfnV2.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <PreprocessorDefinitions>NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="..\standalone\NrCapture\nvfp4\NrSwin4.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <PreprocessorDefinitions>NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="..\standalone\NrCapture\nvfp4\NrNet4.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <PreprocessorDefinitions>NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="..\standalone\NrCapture\nvfp4\NrFp8.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <PreprocessorDefinitions>NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="..\standalone\NrCapture\nvfp4\NrHost.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <PreprocessorDefinitions>NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="framegen\nvngx\Nvngx_Combo.h" />
@@ -938,6 +970,12 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="dlssnr\DlssNr_GpuLifetime.h" />
     <ClInclude Include="dlssnr\DlssNr_HoldParameters_Dx12.h" />
     <ClCompile Include="dlssnr\DlssNr_MenuControls.cpp" />
+    <ClCompile Include="dlssnr\DlssNr_MenuPresets.cpp" />
+    <ClCompile Include="dlssnr\DlssNr_Presets.cpp" />
+    <ClCompile Include="dlssnr\DlssNr_Calibrate.cpp" />
+    <ClInclude Include="dlssnr\DlssNr_Presets.h" />
+    <ClInclude Include="dlssnr\DlssNr_Calibrate.h" />
+    <ClInclude Include="dlssnr\NrCalibrate.h" />
     <ClCompile Include="dlssnr\DlssNr_MenuOverlay.cpp" />
     <ClInclude Include="dlssnr\DlssNr_MenuOverlay.h" />
     <ClInclude Include="dlssnr\DlssNr_MenuSections.h" />

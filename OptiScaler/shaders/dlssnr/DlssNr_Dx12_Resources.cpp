@@ -10,11 +10,14 @@ auto DlssNr_Dx12::State::ParkNrResource(ID3D12Resource*& resource) -> void
     lifetime.Retire([retired] { retired->Release(); });
 }
 
-auto DlssNr_Dx12::State::ReleaseSurfacesIfFormatChanged(DXGI_FORMAT modelFormat, DXGI_FORMAT nativeFormat) -> void
+auto DlssNr_Dx12::State::ReleaseSurfacesIfFormatChanged(DXGI_FORMAT modelFormat, DXGI_FORMAT nativeFormat,
+                                                       DXGI_FORMAT proxyFormat) -> void
 {
+    if (proxyFormat == DXGI_FORMAT_UNKNOWN)
+        proxyFormat = nativeFormat;
     if (nr.output == nullptr ||
         (nr.output->GetDesc().Format == modelFormat && nr.colorCopy && nr.hdrCopy &&
-         nr.colorCopy->GetDesc().Format == nativeFormat && nr.hdrCopy->GetDesc().Format == nativeFormat))
+         nr.colorCopy->GetDesc().Format == proxyFormat && nr.hdrCopy->GetDesc().Format == nativeFormat))
         return;
 
     LOG_INFO("DLSS-NR rebuilding surfaces: model format {} -> {}, frame format {}", (int) nr.output->GetDesc().Format,
@@ -26,7 +29,8 @@ auto DlssNr_Dx12::State::ReleaseSurfacesIfFormatChanged(DXGI_FORMAT modelFormat,
     modelRunning = false;
 
     for (ID3D12Resource** r : { &nr.output, &nr.passScratch, &nr.passClamp, &nr.colorCopy, &nr.hdrCopy, &nr.colorSmall,
-                                &nr.depthSmall, &nr.motionSmall, &nr.outputNative, &nr.activeColor })
+                                &nr.depthSmall, &nr.motionSmall, &nr.outputNative, &nr.activeColor, &nr.compareAnswer,
+                                &nr.compareColor })
         ParkNrResource(*r);
 
     nr.passScratchFailed = false;
@@ -227,6 +231,7 @@ void DlssNr_Dx12::State::ReleaseSupersamplers()
 auto DlssNr_Dx12::State::ReleaseResources() -> void
 {
     std::lock_guard<std::recursive_mutex> nrLock(mutex);
+    ReleaseIndependentPasses();
     ReleaseEnlarger();
     enlargementStatus.clear();
     deferredSr.ReleaseResources();
@@ -240,7 +245,7 @@ auto DlssNr_Dx12::State::ReleaseResources() -> void
     modelRunning = false;
 
     for (auto** resource : { &nr.output, &nr.passScratch, &nr.passClamp, &nr.colorCopy, &nr.hdrCopy, &nr.activeColor,
-                             &nr.colorSmall, &nr.depthSmall, &nr.motionSmall })
+                             &nr.colorSmall, &nr.depthSmall, &nr.motionSmall, &nr.compareAnswer, &nr.compareColor })
         ParkNrResource(*resource);
     ReleaseSpatialResources();
     nr.spatialSignatureValid = false;

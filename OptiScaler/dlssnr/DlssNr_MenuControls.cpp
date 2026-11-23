@@ -1,7 +1,10 @@
 #include "pch.h"
+#include "DlssNrFeature_Dx12.h"
 #include "DlssNr_MenuSections.h"
 #include "DlssNr_Placement.h"
 #include "DlssNr_Status.h"
+#include "PassProfiles.h"
+#include "NrPassBorrow.h"
 #include <shaders/dlssnr/DlssNr_Spatial.h>
 #include <Config.h>
 #include <menu/menu_common.h>
@@ -70,28 +73,41 @@ static void ConstrainSpatialControls(Spatial::Settings& value, float scale)
     value.shiftY = std::clamp(std::isfinite(value.shiftY) ? value.shiftY : 0.0f, y.first, y.second);
 }
 
-static void RenderSpatial(Config* config)
+static void RenderSpatial(Config* config, bool presentationControls = true)
 {
     Checkbox("Peripheral compression", config->DlssNrSpatialCompression);
     HelpMarker(
         "Keep more model detail in the centre and compress the edges. Model resolution still scales the whole image.");
-    bool preview = config->DlssNrDebugView.value_or_default() == 4;
-    if (ImGui::Checkbox("Preview", &preview))
-        config->DlssNrDebugView = preview ? 4u : 0u;
-    HelpMarker("Show the packed model input before spatial unpacking, scaled to fill the screen. "
-               "This is the same as the Compressed model input debug view. "
-               "Without active compression, shows the ordinary model input. Apply model must be enabled.");
+    if (presentationControls)
+    {
+        bool preview = config->DlssNrDebugView.value_or_default() == 4;
+        if (ImGui::Checkbox("Preview", &preview))
+            config->DlssNrDebugView = preview ? 4u : 0u;
+        HelpMarker("Show the packed model input before spatial unpacking, scaled to fill the screen. "
+                   "This is the same as the Compressed model input debug view. "
+                   "Without active compression, shows the ordinary model input. Apply model must be enabled.");
+    }
     if (!config->DlssNrSpatialCompression.value_or_default())
         return;
 
-    const auto feature = State::Instance().currentFeature;
-    const bool nativeVk = feature && feature->Api() == API::Vulkan && !feature->IsWithDx12();
-    const auto status = ReadStatus(nativeVk ? Backend::Vulkan : Backend::Dx12);
-    if (!status.spatialStatus.empty())
-        ImGui::TextWrapped("%s", status.spatialStatus.c_str());
+    if (presentationControls)
+    {
+        const auto feature = State::Instance().currentFeature;
+        const bool nativeVk = feature && feature->Api() == API::Vulkan && !feature->IsWithDx12();
+        const auto status = ReadStatus(nativeVk ? Backend::Vulkan : Backend::Dx12);
+        if (!status.spatialStatus.empty())
+            ImGui::TextWrapped("%s", status.spatialStatus.c_str());
+    }
 
-    static Spatial::Settings pending;
-    static bool editing = false;
+    struct SpatialEdit
+    {
+        Spatial::Settings pending;
+        bool editing = false;
+    };
+    static std::unordered_map<ImGuiID, SpatialEdit> edits;
+    auto& edit = edits[ImGui::GetID("Spatial layout")];
+    auto& pending = edit.pending;
+    auto& editing = edit.editing;
     if (!editing)
         pending = Spatial::ReadSettings(*config);
     const float scale = config->DlssNrWorkingScale.value_or_default();
@@ -130,37 +146,43 @@ static void RenderSpatial(Config* config)
         StoreSpatial(config, pending);
         editing = false;
     }
-    Checkbox("Show centre outline", config->DlssNrSpatialShowCenter);
-    Checkbox("Show working region outline", config->DlssNrSpatialShowWork);
+    if (presentationControls)
+    {
+        Checkbox("Show centre outline", config->DlssNrSpatialShowCenter);
+        Checkbox("Show working region outline", config->DlssNrSpatialShowWork);
+    }
     ImGui::TextWrapped("Centre detail follows Model resolution. Strong edge compression can soften detail or shimmer "
                        "during movement.");
 }
 
-void RenderInput(Config* config)
+static void RenderResolution(Config* config, bool presentationControls)
 {
     // Resolution changes rebuild model resources; commit only after releasing the slider.
-    static int pendingScale = -1;
+    static std::unordered_map<ImGuiID, int> pendingScales;
+    const ImGuiID scaleId = ImGui::GetID("Model resolution");
+    const auto pending = pendingScales.find(scaleId);
 
-    int scalePercent =
-        pendingScale >= 0 ? pendingScale : (int) lroundf(config->DlssNrWorkingScale.value_or_default() * 100.0f);
+    int scalePercent = pending != pendingScales.end()
+                           ? pending->second
+                           : (int) lroundf(Profiles::PassResolutionSettings(*config, 0).workingScale * 100.0f);
 
     if (ImGui::SliderInt("Model resolution", &scalePercent, 25, 200, "%d%%"))
-        pendingScale = scalePercent;
+        pendingScales[scaleId] = scalePercent;
 
-    if (ImGui::IsItemDeactivatedAfterEdit() && pendingScale >= 0)
+    if (ImGui::IsItemDeactivatedAfterEdit())
     {
-        config->DlssNrWorkingScale = std::clamp(pendingScale, 25, 200) / 100.0f;
+        config->DlssNrWorkingScale = std::clamp(scalePercent, 25, 200) / 100.0f;
         if (config->DlssNrSpatialCompression.value_or_default())
         {
             auto spatial = Spatial::ReadSettings(*config);
             ConstrainSpatialControls(spatial, config->DlssNrWorkingScale.value_or_default());
             StoreSpatial(config, spatial);
         }
-        pendingScale = -1;
+        pendingScales.erase(scaleId);
     }
 
     HelpMarker("50% halves width and height. 100% uses the full input size.");
-    RenderSpatial(config);
+    RenderSpatial(config, presentationControls);
 
     if (scalePercent > 100)
     {
@@ -181,21 +203,35 @@ void RenderInput(Config* config)
         ImGui::BeginDisabled(!reduced);
 
         static const char* enlargeNames[] = {
-            "Classic",           "Matched residual",         "Matched residual + DLSS",
-            "Lighting + colour", "Lighting + colour + DLSS", "Edge-aware"
+            "Classic",           "Matched residual",         "Matched residual + private upscaler",
+            "Lighting + colour", "Lighting + colour + private upscaler", "Edge-aware"
         };
         int enlarge = (int) std::min(config->DlssNrTransfer.value_or_default(), 5u);
 
         if (ImGui::Combo("Enlargement", &enlarge, enlargeNames, IM_ARRAYSIZE(enlargeNames)))
             config->DlssNrTransfer = (uint32_t) enlarge;
 
-        ImGui::EndDisabled();
-
         HelpMarker("Below 100%: Lighting + colour resizes lighting gain and colour changes separately, then applies "
                    "them at full resolution. This can reduce resize halos; fully black pixels remain black. "
                    "Edge-aware uses the original picture's brightness to keep edits on the correct side of edges. "
-                   "DLSS modes require post-upscale DX12 processing.");
+                   "Private upscaler modes require post-upscale DX12 processing.");
+
+        if (enlarge == 2 || enlarge == 4)
+        {
+            static const char* backends[] = { "DLSS SR", "FSR 2.2", "FidelityFX", "XeSS" };
+            int backend = Profiles::PassResolutionSettings(*config, 0).privateUpscaler;
+            if (ImGui::Combo("Private upscaler", &backend, backends, IM_ARRAYSIZE(backends)))
+                config->DlssNrPrivateUpscaler = backend;
+            HelpMarker("Upscaler used by this pass for temporal enlargement. Requires its installed runtime. "
+                       "Unavailable on native Vulkan: select a spatial enlargement mode there.");
+        }
+        ImGui::EndDisabled();
     }
+}
+
+void RenderInput(Config* config)
+{
+    RenderResolution(config, true);
     static const char* reversibleNames[] = { "Off (soft knee)", "Neutwo proxy + composed", "Neutwo proxy + replace",
                                              "Hybrid proxy + composed", "Hybrid proxy + replace" };
     int reversible = (int) config->DlssNrReversibleMode.value_or_default();
@@ -277,32 +313,167 @@ static void DeferredSlider(const char* label, Option* opt, float mn, float mx, f
 
 template <typename Option> static void NrModelCombo(Option* opt, bool allowInherit)
 {
-    static const char* names[] = { "Automatic", "Original", "Optimized" };
+    // DlssNr::Nvfp4::kModels, sorted by the precision of the weights: FP8 (the runtime's presets 1 and 2 and the FP8
+    // pass-in-one models), INT8, NVFP4 (4-bit).
     const bool inherited = allowInherit && !opt->has_value();
     const uint32_t preset = opt->has_value() ? opt->value() : 0u;
-    const char* preview = inherited                      ? "Inherit pass 1"
-                          : preset < IM_ARRAYSIZE(names) ? names[preset]
-                                                         : "Unavailable preset";
+    const char* preview = inherited ? "Inherit pass 1" : DlssNr::Nvfp4::ModelName(preset);
 
     if (ImGui::BeginCombo("NR model", preview))
     {
         if (allowInherit && ImGui::Selectable("Inherit pass 1", inherited))
             *opt = std::optional<uint32_t> {};
-        for (uint32_t value = 0; value < IM_ARRAYSIZE(names); ++value)
+        for (const auto& model : DlssNr::Nvfp4::kModels)
         {
-            const bool selected = !inherited && preset == value;
-            if (ImGui::Selectable(names[value], selected))
-                *opt = value;
+            const bool selected = !inherited && preset == model.preset;
+            if (ImGui::Selectable(model.name, selected))
+                *opt = (uint32_t) model.preset;
             if (selected)
                 ImGui::SetItemDefaultFocus();
         }
         ImGui::EndCombo();
     }
-    HelpMarker("Automatic: use the installed NR runtime's default model.\n"
-               "Original: use the original model (preset 1).\n"
-               "Optimized: use the smaller FP8 model (preset 2), included in NR 310.9.16.0.\n"
+    HelpMarker("The list is sorted by the precision of the weights: FP8, INT8, NVFP4.\n"
+               "Automatic: use the installed NR runtime's default model.\n"
+               "FP8 Original: the original model (preset 1).\n"
+               "FP8 Optimized: the smaller FP8 model (preset 2), included in NR 310.9.16.0.\n"
                "Older runtimes fall back to their default when a model is unavailable.\n"
+               "FP8 2xPass-in-one, FP8 3xPass-in-one: the look of two or three passes in one, as FP8 models for\n"
+               "RTX 40 and 50 series GPUs (NVIDIA's own FP8 kernels with weights of ours; files in\n"
+               "OptiScaler/nvfp4/fp8). The v2 models are the same two with other weights.\n"
+               "INT8 Original, INT8 2xPass-in-one: INT8 models for RTX 30, 40 and 50 series GPUs (D3D12 path;\n"
+               "files in OptiScaler/nvfp4/int8). They run wholly on kernels of ours and need no NR runtime.\n"
+               "NVFP4 Original, NVFP4 2xPass-in-one, NVFP4 3xPass-in-one: 4-bit models for RTX 50 series GPUs\n"
+               "(D3D12 path; files in OptiScaler/nvfp4). They carry all their own weights and use none of the\n"
+               "runtime's, so any NR runtime that offers the original model (preset 1) works, such as 310.8.0\n"
+               "or 310.9.16.0.\n"
+               "The 4K models (NVFP4 and FP8): the same models with weights made for 4K output.\n"
+               "There is no fallback: if a model of ours cannot run, NR is not applied and the reason is shown\n"
+               "here in red.\n"
+               "Run a pass-in-one model as ONE pass: Cinematic, intensity, tone and structure at 1.\n"
                "Changing the model rebuilds this pass and resets its history.");
+    if (!inherited && DlssNr::Nvfp4::IsNvfp4(preset))
+    {
+        const char* kind = DlssNr::Nvfp4::IsInt8(preset) ? "INT8" : DlssNr::Nvfp4::IsFp8(preset) ? "FP8" : "4-bit";
+        if (const auto problem = DlssNr::Nvfp4::Problem(); !problem.empty())
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.3f, 1.0f));
+            ImGui::TextWrapped("%s model is NOT running, NR is not applied: %s", kind, problem.c_str());
+            ImGui::PopStyleColor();
+        }
+        else if (DlssNr::Nvfp4::Running())
+            ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.45f, 1.0f), "%s model running", kind);
+        else
+            ImGui::TextDisabled("%s model starting...", kind);
+    }
+}
+
+static void RenderPassResolution(Config* config, unsigned int selectedPass)
+{
+    if (!ImGui::TreeNode("Resolution and upscaling"))
+        return;
+
+    if (selectedPass == 0)
+    {
+        ImGui::TextDisabled("Pass 1 also supplies defaults for later passes.");
+        RenderResolution(config, false);
+    }
+    else
+    {
+        auto& extra = config->DlssNrPassOverrides[selectedPass - 1];
+        bool independent = Profiles::HasPassResolutionOverride(extra);
+        if (ImGui::Checkbox("Independent resolution and upscaling", &independent))
+        {
+            if (independent)
+                Profiles::SetPassResolutionSettings(extra, Profiles::PassResolutionSettings(*config, selectedPass));
+            else
+                Profiles::ClearPassResolutionSettings(extra);
+        }
+        HelpMarker("Give this pass its own model resolution, enlargement, downsampling and peripheral compression. "
+                   "Each pass reconstructs the full input size before the next pass. "
+                   "Turning this off restores pass 1's sizing settings and keeps this pass's model tuning.");
+
+        if (independent)
+        {
+            const auto before = Profiles::PassResolutionSettings(*config, selectedPass);
+            Config values = *config;
+            Profiles::ApplyPassConfig(values, *config, selectedPass);
+            RenderResolution(&values, false);
+            const auto after = Profiles::PassResolutionSettings(values, 0);
+            if (!(before == after))
+                Profiles::SetPassResolutionSettings(extra, after);
+        }
+        else
+        {
+            const auto inherited = Profiles::PassResolutionSettings(*config, selectedPass);
+            ImGui::TextDisabled("Inherits pass 1: %.0f%% model resolution, peripheral compression %s.",
+                                inherited.workingScale * 100.0f, inherited.spatial.enabled ? "on" : "off");
+        }
+    }
+    ImGui::TreePop();
+}
+
+// Later passes can skip the model (re-apply) or skip part of it (borrow from the frame's first model pass).
+// Quality figures: Model A, 4K median PSNR against two real passes; one pass alone is 32.1 dB.
+static void RenderPassReuse(Config* config, unsigned int selectedPass)
+{
+    auto& pass = config->DlssNrPassOverrides[selectedPass - 1];
+    bool reapply = pass.reapply.value_or(false);
+    if (ImGui::Checkbox("Re-apply previous change", &reapply))
+        pass.reapply = reapply;
+    HelpMarker("Skip the model and repeat the previous model pass's change in one tiny dispatch "
+               "(41.5 dB at gain 0.81, 39.2 dB at gain 1).");
+    if (reapply)
+    {
+        Slider("Re-apply gain", config->DlssNrReapplyGain, 0.0f, 2.0f, "%.2f", 0.81f);
+        HelpMarker("Shared by every re-applying pass: 1 repeats the change exactly, 0.81 measured best.");
+    }
+
+    const auto feature = State::Instance().currentFeature;
+    const bool nativeVk = feature ? feature->Api() == API::Vulkan && !feature->IsWithDx12()
+                                  : State::Instance().swapchainApi == API::Vulkan;
+    // The same pass count the run uses, so the menu and the chain choice agree.
+    const unsigned runPasses = std::clamp(config->DlssNrPasses.value_or_default(), 1u,
+                                          config->DlssNrUnlockPasses.value_or_default() ? DlssNr::MaxPassCount
+                                                                                        : DlssNr::DefaultMaxPassCount);
+    const bool independent =
+        Profiles::HasPassResolutionOverride(pass) || Profiles::HasPassResolutionOverrides(*config, runPasses);
+    const char* unavailable = reapply       ? "Unavailable while this pass re-applies the previous change."
+                              : nativeVk    ? "Unavailable on native Vulkan: borrowing intercepts the D3D12 NR "
+                                              "runtime's kernel launches."
+                              : independent ? "Unavailable with independent pass resolution: every pass must run "
+                                              "the same model at the same size."
+                                            : nullptr;
+    ImGui::BeginDisabled(unavailable != nullptr);
+    bool transformer = pass.borrowTransformer.value_or(false);
+    if (ImGui::Checkbox("Borrow pass 1's transformer", &transformer))
+        pass.borrowTransformer = transformer;
+    ImGui::EndDisabled();
+    HelpMarker(unavailable ? unavailable
+                           : "Run the model but take pass 1's transformer blocks instead of recomputing them; saves "
+                             "GPU time (43.6 dB).");
+    ImGui::BeginDisabled(unavailable != nullptr);
+    bool below = pass.borrowBelow.value_or(false);
+    if (ImGui::Checkbox("Borrow everything at 1/x size and below", &below))
+        pass.borrowBelow = below;
+    ImGui::EndDisabled();
+    HelpMarker(unavailable ? unavailable
+                           : "Run only the outer, larger blocks and take everything at 1/x of the frame size and "
+                             "smaller from pass 1; overrides the transformer box (1/32 43.1, 1/16 42.1, 1/8 40.7, "
+                             "1/4 40.7, 1/2 40.0 dB).");
+    static const unsigned levels[] = { 2, 4, 8, 16, 32 };
+    static const char* levelNames[] = { "1/2", "1/4", "1/8", "1/16", "1/32" };
+    // Show the level the run will use: ChooseCut snaps an INI value to the nearest (Below2..Below32 = 6..2).
+    int index = 6 - int(NrPassBorrow::ChooseCut(false, true, pass.borrowLevel.value_or(32u)));
+    ImGui::BeginDisabled(unavailable != nullptr || !below);
+    ImGui::Indent();
+    if (ImGui::Combo("Borrow at 1/x and below", &index, levelNames, IM_ARRAYSIZE(levelNames)))
+        pass.borrowLevel = (uint32_t) levels[index];
+    ImGui::Unindent();
+    ImGui::EndDisabled();
+    char status[192];
+    NrPassBorrow::Status(status, sizeof(status));
+    ImGui::TextDisabled("%s", status);
 }
 
 void RenderModel(Config* config)
@@ -323,7 +494,27 @@ void RenderModel(Config* config)
         config->DlssNrPasses = std::clamp(config->DlssNrPasses.value_or_default(), 1u, unlockPasses ? 10u : 2u);
     }
 
-    static unsigned selectedPass = 0;
+    // Pass shortcuts sit right under the pass count so they are visible without picking a pass to edit.
+    const unsigned activePasses = std::clamp(config->DlssNrPasses.value_or_default(), 1u, (unsigned) menuPassLimit);
+    if (activePasses >= 2)
+    {
+        ImGui::SeparatorText("Later-pass shortcuts (re-apply / borrow)");
+        for (unsigned shortcutPass = 1; shortcutPass < activePasses; ++shortcutPass)
+        {
+            ImGui::PushID(1000 + (int) shortcutPass);
+            if (activePasses > 2)
+                ImGui::TextDisabled("Pass %u", shortcutPass + 1);
+            RenderPassReuse(config, shortcutPass);
+            ImGui::PopID();
+        }
+        ImGui::Separator();
+    }
+    else
+    {
+        ImGui::TextDisabled("Set 2 or more passes for the re-apply and borrow options.");
+    }
+
+    unsigned& selectedPass = EditPass();
     const auto selectedLabel = std::format("Pass {}", selectedPass + 1);
     if (ImGui::BeginCombo("Edit pass", selectedLabel.c_str()))
     {
@@ -386,6 +577,7 @@ void RenderModel(Config* config)
             pass.style = style ? std::optional<uint32_t>(style - 1) : std::nullopt;
         tuning(pass.intensity, pass.structure, pass.tone, pass.skin, pass.autoMask);
     }
+    RenderPassResolution(config, selectedPass);
     ImGui::PopID();
 }
 
@@ -463,10 +655,40 @@ void RenderInspect(Config* config)
     if (ImGui::Combo("Compare", &compare, compareNames, IM_ARRAYSIZE(compareNames)))
         config->DlssNrCompare = (uint32_t) compare;
 
-    HelpMarker("Compare the original and NR output.");
+    HelpMarker("Compare the NR output with the original picture, or with another NR model.");
 
     if (compare != 0)
     {
+        // What lies beside the NR picture: the original picture, or one pass of another model.
+        const uint32_t other = config->DlssNrCompareModel.value_or_default();
+        if (ImGui::BeginCombo("Other side", other == 0 ? "Original picture" : DlssNr::Nvfp4::ModelName(other)))
+        {
+            if (ImGui::Selectable("Original picture", other == 0))
+                config->DlssNrCompareModel = 0u;
+            for (const auto& model : DlssNr::Nvfp4::kModels)
+                if (model.preset != 0 && ImGui::Selectable(model.name, other == model.preset))
+                    config->DlssNrCompareModel = (uint32_t) model.preset;
+            ImGui::EndCombo();
+        }
+        HelpMarker("Compare two models directly: the NR picture on one side, and on the other the same frame\n"
+                   "through ONE pass of the model chosen here, with pass 1's style and strengths.\n"
+                   "Both models are loaded and run every frame, so the frame costs more while this is on.\n"
+                   "Not available with a debug view, peripheral compression, pass borrowing, supersampling or\n"
+                   "DLSS enlargement.");
+        if (other != 0)
+        {
+            if (DlssNr::Nvfp4::ComparisonShown() == other)
+                ImGui::TextColored(ImVec4(0.45f, 0.9f, 0.45f, 1.0f), "Comparing with %s",
+                                   DlssNr::Nvfp4::ModelName(other));
+            else if (const auto note = DlssNr::Nvfp4::ComparisonNote(); !note.empty())
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.3f, 1.0f));
+                ImGui::TextWrapped("The other model is NOT shown (that side is the original picture): %s",
+                                   note.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
+
         Checkbox("Swap sides", config->DlssNrCompareSwap);
         Checkbox("Label the sides", config->DlssNrCompareTags);
         if (config->DlssNrCompareTags.value_or_default())

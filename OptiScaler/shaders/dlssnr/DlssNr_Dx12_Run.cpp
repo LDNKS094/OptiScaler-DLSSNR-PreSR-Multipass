@@ -1,12 +1,277 @@
 #include "pch.h"
 #include "DlssNr_Dx12_State.h"
+#include <dlssnr/NrPassBorrow.h>
+#include <dlssnr/NrNvfp4.h>
+#include <dlssnr/PassProfiles.h>
+#include <Util.h>
+
+void DlssNr_Dx12::State::ReleaseIndependentPasses()
+{
+    for (auto& pass : independentPasses)
+        DlssNr_Dx12::Retire(std::move(pass));
+    independentSizes.clear();
+    independentModels.clear();
+    independentStatus.clear();
+    independentSpatialStatus.clear();
+    independentActive = false;
+    nr.reset = true;
+}
+
+bool DlssNr_Dx12::State::RunIndependentPasses(EncodeContext& encoded, ID3D12Resource* depth,
+                                              ID3D12Resource* motion, unsigned int passes,
+                                              ID3D12CommandQueue* queue)
+{
+    const auto& cfg = RunConfig();
+    auto* cmd = encoded.cmdList;
+    std::vector<DlssNr::Profiles::ResolutionSettings> sizes;
+    std::vector<DlssNr::ModelSettings> models;
+    std::vector<bool> reapplies;
+    for (unsigned pass = 0; pass < passes; ++pass)
+    {
+        // A re-applying pass has no child: it repeats the previous child's change in one dispatch here.
+        reapplies.push_back(DlssNr::Profiles::PassReapplies(cfg, pass));
+        if (reapplies.back())
+            continue;
+        sizes.push_back(DlssNr::Profiles::PassResolutionSettings(cfg, pass));
+        models.push_back(PassSettings(cfg, pass));
+    }
+    if (reapplies != independentReapply)
+        LOG_INFO("DLSS-NR independent passes: configured {}, {} re-applied (gain {:.3f})", passes,
+                 std::count(reapplies.begin(), reapplies.end(), true), DlssNr::Profiles::ReapplyGain(cfg));
+    const bool reset = nr.reset || sizes != independentSizes || models != independentModels ||
+                       reapplies != independentReapply;
+    independentSizes = std::move(sizes);
+    independentModels = std::move(models);
+    independentReapply = std::move(reapplies);
+    for (unsigned pass = 0; pass < independentPasses.size(); ++pass)
+        if (pass >= passes || independentReapply[pass])
+            DlssNr_Dx12::Retire(std::move(independentPasses[pass]));
+
+    // Every child owns its NGX history, reconstruction surfaces and descriptor ring. Only the
+    // encoded proxy crosses a stage boundary; the immutable scene remains in this owner's hdrCopy.
+    auto frame = encoded.frame;
+    frame.ColourIsLinearHdr = false;
+    frame.ExposureTexture = nullptr;
+    frame.WhitePointOverride = 1.0f;
+    frame.Reset = reset;
+    if (nr.heldActive)
+        frame.MvScaleX = frame.MvScaleY = 0;
+    ID3D12Resource* source = nr.colorCopy;
+    ID3D12Resource* answer = nullptr;
+    bool ok = nr.passScratch && nr.passClamp;
+    bool clampReadable = false;
+    independentStatus.clear();
+    independentSpatialStatus.clear();
+    nr.spatialActive = false;
+    unsigned lastNetwork = 0;
+    ngxTime->Start(cmd);
+    for (unsigned pass = 0; ok && pass < passes;)
+    {
+        if (const auto run = pass == 0 ? 0 : DlssNr::Profiles::ReapplyRun(cfg, pass, passes))
+        {
+            // source and answer are the last child's input and answer; write the other ping-pong texture.
+            auto* reapplied = answer == nr.output ? nr.passScratch : nr.output;
+            if (source == nr.passClamp)
+                Barrier(cmd, nr.passClamp, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            DlssNrConstants reapply {};
+            reapply.Mode = DlssNrMode_Reapply;
+            reapply.WhitePoint = float(run) * DlssNr::Profiles::ReapplyGain(cfg);
+            reapply.Width = nr.width;
+            reapply.Height = nr.height;
+            const bool dispatched =
+                shader.DispatchPass(cmd, reapply, source, answer, nullptr, nullptr, nullptr, reapplied, nullptr);
+            if (source == nr.passClamp)
+                Barrier(cmd, nr.passClamp, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if (!dispatched)
+            {
+                ReportSkipOnce("the re-apply dispatch failed; using the last model answer");
+                break;
+            }
+            Barrier(cmd, answer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            Barrier(cmd, reapplied, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            answer = reapplied;
+            for (unsigned i = 0; i < run; ++i)
+                independentSpatialStatus += "; Pass " + std::to_string(pass + i + 1) + ": re-applied";
+            pass += run;
+        }
+        else
+        {
+            if (!independentPasses[pass])
+                independentPasses[pass] = std::make_unique<DlssNr_Dx12>("DLSS-NR independent pass " +
+                                                                           std::to_string(pass + 1), encoded.device);
+            Config profile = cfg;
+            DlssNr::Profiles::ApplyPassConfig(profile, cfg, pass);
+            profile.DlssNrReversibleMode = 2u; // Encoded proxy in, reconstructed proxy out; no scene composition.
+            profile.DlssNrApplyModel = true;
+            profile.DlssNrCompare = 0u;
+            profile.DlssNrDebugView = 0u;
+            profile.DlssNrSkinProtection = false;
+            profile.DlssNrShowSkinMask = false;
+            profile.DlssNrHoldFrame = false;
+            profile.DlssNrReplaceDetailStrength = 0.0f;
+            profile.DlssNrHaloSuppression = 0.0f;
+            profile.DlssNrHaloBrightSuppression = 0.0f;
+            profile.DlssNrSpatialShowCenter = false;
+            profile.DlssNrSpatialShowWork = false;
+            auto* target = pass % 2 ? nr.passScratch : nr.output;
+            ok = independentPasses[pass]->DispatchConfigured(cmd, source, depth, motion, target, frame, queue,
+                                                             &profile);
+            if (clampReadable)
+            {
+                Barrier(cmd, nr.passClamp, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                clampReadable = false;
+            }
+            if (!ok)
+            {
+                const auto& child = *independentPasses[pass]->_state;
+                const std::string reason = child.nr.failed ? child.nr.reason
+                                           : !child.enlargementStatus.empty() ? child.enlargementStatus
+                                           : child.nr.spatialFallback ? child.nr.spatialFallbackReason
+                                                                      : "waiting for model initialization";
+                independentStatus = "Pass " + std::to_string(pass + 1) + ": " + reason;
+                break;
+            }
+            const auto& child = *independentPasses[pass]->_state;
+            if (!independentSpatialStatus.empty())
+                independentSpatialStatus += "; ";
+            independentSpatialStatus += "Pass " + std::to_string(pass + 1) + ": " +
+                                        std::to_string(child.nr.workWidth) + "x" + std::to_string(child.nr.workHeight);
+            if (child.nr.spatialLayout.requested)
+            {
+                if (child.nr.spatialFallback)
+                    independentSpatialStatus +=
+                        std::string(" (spatial fallback: ") + child.nr.spatialFallbackReason + ")";
+                else if (!child.nr.spatialLayout.active)
+                    independentSpatialStatus += " (spatial unavailable: " + child.nr.spatialLayout.reason + ")";
+                else
+                    independentSpatialStatus += " (peripheral compression)";
+            }
+            nr.spatialActive = nr.spatialActive || child.nr.spatialActive;
+            Barrier(cmd, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            answer = target;
+            lastNetwork = pass++;
+        }
+        if (pass < passes && !DlssNr::Profiles::PassReapplies(cfg, pass))
+        {
+            DlssNrConstants clamp {};
+            clamp.Mode = DlssNrMode_ClampProxy;
+            clamp.Width = nr.width;
+            clamp.Height = nr.height;
+            ok = shader.DispatchPass(cmd, clamp, answer, nullptr, nullptr, nullptr, nullptr, nr.passClamp, nullptr);
+            Barrier(cmd, answer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            answer = nullptr;
+            Barrier(cmd, nr.passClamp, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            clampReadable = true;
+            source = nr.passClamp;
+        }
+    }
+    ngxTime->End(cmd);
+
+    if (clampReadable)
+        Barrier(cmd, nr.passClamp, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (ok && answer && DlssNr_Common::HaloEnabled(cfg) && cfg.DlssNrDebugView.value_or_default() != 2)
+    {
+        DlssNrConstants halo {};
+        halo.Mode = DlssNrMode_SuppressHalo;
+        halo.Width = nr.width;
+        halo.Height = nr.height;
+        DlssNr_Common::SetQualityConstants(halo, cfg);
+        if (shader.DispatchPass(cmd, halo, nr.colorCopy, answer, nullptr, nullptr, nullptr, nr.passClamp, nullptr))
+        {
+            Barrier(cmd, answer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            answer = nr.passClamp;
+            Barrier(cmd, answer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+    }
+
+    bool composed = false;
+    if (ok && answer)
+    {
+        auto resolve = MakeResolveConstants(encoded, passes);
+        resolve.Transfer = 0; // Each stage has already reconstructed its answer at native size.
+        resolve.ModelWorkScale = 1.0f;
+        ID3D12Resource* resolveProxy = nr.colorCopy;
+        bool childProxyReadable = false;
+        if (resolve.DebugView == 4)
+        {
+            // Inspect the last pass's actual model input, including its peripheral warp.
+            const auto& last = independentPasses[lastNetwork]->_state->nr;
+            resolveProxy = last.spatialActive ? last.spatialColor
+                           : last.colorSmall ? last.colorSmall : last.colorCopy;
+            Barrier(cmd, resolveProxy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            childProxyReadable = true;
+            resolve.DebugView = 1;
+        }
+        if (encoded.targetSupportsUav)
+        {
+            Barrier(cmd, encoded.target, encoded.targetState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            encoded.targetState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
+        else
+            Barrier(cmd, nr.hdrCopy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        composed = shader.DispatchPass(cmd, resolve, resolveProxy, answer,
+                                        encoded.targetSupportsUav ? nr.hdrCopy : encoded.target, encoded.exposure,
+                                        nullptr, encoded.targetSupportsUav ? encoded.target : nr.hdrCopy, nullptr);
+        if (childProxyReadable)
+            Barrier(cmd, resolveProxy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (!encoded.targetSupportsUav)
+        {
+            if (composed)
+            {
+                Barrier(cmd, nr.hdrCopy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                Barrier(cmd, encoded.target, encoded.targetState, D3D12_RESOURCE_STATE_COPY_DEST);
+                cmd->CopyResource(encoded.target, nr.hdrCopy);
+                Barrier(cmd, encoded.target, D3D12_RESOURCE_STATE_COPY_DEST, encoded.targetState);
+                Barrier(cmd, nr.hdrCopy, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            }
+            else
+                Barrier(cmd, nr.hdrCopy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        if (composed && captureFrames.isActive())
+            captureFrames.record(cmd, encoded.device, nr.colorCopy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                 encoded.target, encoded.targetState);
+        if (composed && !passConfig)
+            DlssNr::Calibrate::Composed();
+    }
+    if (answer)
+        Barrier(cmd, answer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    nr.reset = !composed;
+    modelRunning = composed;
+    if (!composed)
+    {
+        if (independentStatus.empty())
+            independentStatus = "Independent pass reconstruction could not complete";
+        for (auto& pass : independentPasses)
+            if (pass)
+                pass->_state->nr.reset = true;
+        ReportSkipOnce(independentStatus.c_str());
+    }
+    return composed;
+}
 
 auto DlssNr_Dx12::State::Run(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* colour, ID3D12Resource* depth,
                              ID3D12Resource* motion, ID3D12Resource* output, const DlssNrFrameInfo& frame,
                              ID3D12CommandQueue* timingQueue) -> void
 {
     std::lock_guard<std::recursive_mutex> nrLock(mutex);
-    const Config& cfg = *Config::Instance();
+    // The slider calibrator changes the settings between frames, here, before this frame reads them.
+    if (!passConfig)
+        DlssNr::Calibrate::Tick(*Config::Instance(), captureFrames);
+    const Config& cfg = RunConfig();
     nr.spatialActive = false;
 
     if (nr.failed || cmdList == nullptr || colour == nullptr || depth == nullptr || motion == nullptr ||
@@ -112,9 +377,15 @@ auto DlssNr_Dx12::State::Run(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
     const unsigned int requestedPasses =
         std::clamp(cfg.DlssNrPasses.value_or_default(), 1u,
                    cfg.DlssNrUnlockPasses.value_or_default() ? DlssNr::MaxPassCount : DlssNr::DefaultMaxPassCount);
+    const bool independent = !passConfig && DlssNr::Profiles::HasPassResolutionOverrides(cfg, requestedPasses);
+    if (!independent && independentActive)
+        ReleaseIndependentPasses();
+    independentActive = independent;
     for (auto& model : nr.models)
         model.Collect();
-    if ((!NVNGXProxy::IsDx12Inited() && !NVNGXProxy::InitDx12(device)) || !DlssNr::Proxy::Context::Available())
+    // (The INT8 models run on the own pass host and need no NR runtime.)
+    if (DlssNr::Profiles::NeedsRuntime(cfg, requestedPasses) &&
+        ((!NVNGXProxy::IsDx12Inited() && !NVNGXProxy::InitDx12(device)) || !DlssNr::Proxy::Context::Available()))
     {
         nr.failed = true;
         nr.reason = "the NVIDIA NGX driver does not provide Neural Rendering";
@@ -123,7 +394,7 @@ auto DlssNr_Dx12::State::Run(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
     }
 
     // Only the model runs at working resolution; source and composition remain at native size.
-    float workScale = cfg.DlssNrWorkingScale.value_or_default();
+    float workScale = independent ? 1.0f : cfg.DlssNrWorkingScale.value_or_default();
     if (!std::isfinite(workScale))
         workScale = 1.0f;
     workScale = std::clamp(workScale, 0.25f, 2.0f);
@@ -131,7 +402,9 @@ auto DlssNr_Dx12::State::Run(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
     const auto workHeight = (unsigned int) (height * workScale + 0.5f);
     const bool reduced = workWidth != width || workHeight != height;
 
-    const auto spatialSettings = DlssNr::Spatial::ReadSettings(cfg);
+    auto spatialSettings = DlssNr::Spatial::ReadSettings(cfg);
+    if (independent)
+        spatialSettings.enabled = false;
     const auto spatialLayout = DlssNr::Spatial::Build(spatialSettings, width, height, workScale);
     const bool spatialSignatureChanged =
         nr.spatialSignatureValid &&
@@ -170,7 +443,7 @@ auto DlssNr_Dx12::State::Run(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
     const unsigned modelWidth = spatial ? spatialLayout.modelW : workWidth;
     const unsigned modelHeight = spatial ? spatialLayout.modelH : workHeight;
     if (!PrepareRunModels(cmdList, device, frame, desc, { width, height }, { modelWidth, modelHeight }, workScale,
-                          requestedPasses, spatial))
+                          requestedPasses, spatial, independent))
         return;
     // The parameter adapter already combined the HDR flag with the active color format.
     const bool isHdrBuffer = frame.ColourIsLinearHdr;
@@ -269,6 +542,22 @@ auto DlssNr_Dx12::State::Run(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
         return;
     }
     auto* modelInput = encoded.modelInput;
+
+    if (independent)
+    {
+        const bool composed = encoded.encodeSucceeded &&
+                              RunIndependentPasses(encoded, depth, motion, requestedPasses, timingQueue);
+        targetState = encoded.targetState;
+        Barrier(cmdList, nr.hdrCopy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Barrier(cmdList, nr.colorCopy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        FinishColor(composed);
+        if (composed)
+            ++nr.successfulDispatches;
+        EndGpuTiming(cmdList);
+        return;
+    }
 
     ID3D12Resource* depthIn = ReadableGuide(device, cmdList, depth, &nr.depthClone);
     ID3D12Resource* motionIn = ReadableGuide(device, cmdList, motion, &nr.motionClone);
@@ -437,22 +726,64 @@ auto DlssNr_Dx12::State::Run(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
     // Count only a contiguous set of ready, separate feature histories. A failed extra creation never
     // falls back to reusing the main feature: that tells one temporal model several frames elapsed in
     // one game frame and makes its history fight the later layers.
+    // A re-applying pass needs no feature: it repeats the last network pass's change in one dispatch.
     unsigned int effectivePasses = 1;
+    unsigned int reappliedPasses = 0;
     if (nr.passScratch != nullptr)
     {
         for (unsigned int pass = 1; pass < requestedPasses; ++pass)
         {
-            if (!nr.models[pass].Ready(frame.SubmissionEpoch))
+            const bool reapply = DlssNr::Profiles::PassReapplies(cfg, pass);
+            if (!reapply && !nr.models[pass].Ready(frame.SubmissionEpoch))
                 break;
             ++effectivePasses;
+            reappliedPasses += reapply;
         }
     }
 
-    if (loggedConfigured != requestedPasses || loggedEffective != effectivePasses)
+    if (loggedConfigured != requestedPasses || loggedEffective != effectivePasses ||
+        loggedReapplied != reappliedPasses)
     {
         loggedConfigured = requestedPasses;
         loggedEffective = effectivePasses;
-        LOG_INFO("DLSS-NR model passes: configured {}, effective {}", requestedPasses, effectivePasses);
+        loggedReapplied = reappliedPasses;
+        LOG_INFO("DLSS-NR model passes: configured {}, effective {} ({} re-applied, gain {:.3f})", requestedPasses,
+                 effectivePasses, reappliedPasses, DlssNr::Profiles::ReapplyGain(cfg));
+    }
+
+    // Borrowing (shared resolution, D3D12 only): one cut per network evaluation; the first never borrows.
+    NrPassBorrow::Cut cuts[DlssNr::MaxPassCount] {};
+    unsigned int evaluations = 0;
+    bool borrowing = false;
+    for (unsigned int pass = 0; pass < effectivePasses; ++pass)
+    {
+        if (DlssNr::Profiles::PassReapplies(cfg, pass))
+            continue;
+        const auto choice = DlssNr::Profiles::PassBorrow(cfg, pass);
+        const auto cut = evaluations == 0 ? NrPassBorrow::Cut::None
+                                          : NrPassBorrow::ChooseCut(choice.transformer, choice.below, choice.level);
+        cuts[evaluations++] = cut;
+        borrowing = borrowing || cut != NrPassBorrow::Cut::None;
+    }
+    static_assert(sizeof(cuts) == sizeof(borrowCuts));
+    if (std::memcmp(borrowCuts, cuts, sizeof(cuts)) != 0)
+    {
+        std::memcpy(borrowCuts, cuts, sizeof(cuts));
+        NrPassBorrow::Reset();
+    }
+    if (borrowing)
+        NrPassBorrow::BeginFrame(cmdList, cuts, evaluations);
+    unsigned int evaluation = 0;
+
+    // The 4-bit kernels and pass-in-one weight sets (model choices 4..6): loaded when a pass first asks for them.
+    // No fallback: a pass that asked for one and was not run by our kernels is not shown (nvfp4Rejected).
+    bool nvfp4Rejected = false;
+    {
+        const bool nvfp4 = DlssNr::Profiles::WantsNvfp4(cfg, effectivePasses);
+        DlssNr::Nvfp4::Configure(nvfp4, Util::DllPath().parent_path() / L"OptiScaler" / L"nvfp4");
+        static unsigned int nvfp4Frames = 0;
+        if (nvfp4 && nvfp4Frames++ % 600 == 30)
+            LOG_INFO("DLSS-NR NVFP4 status: {}", DlssNr::Nvfp4::Status());
     }
 
     // Keep the encoded base immutable; ping-pong model outputs and compose the final delta once.
@@ -507,40 +838,166 @@ auto DlssNr_Dx12::State::Run(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
     modelFrame.mvScaleX = spatial ? 1.0f : frame.MvScaleX * mvToWorkX;
     modelFrame.mvScaleY = spatial ? 1.0f : frame.MvScaleY * mvToWorkY;
 
-    for (unsigned int pass = 0; pass < effectivePasses && result == NVSDK_NGX_Result_Success; ++pass)
+    for (unsigned int pass = 0; pass < effectivePasses && result == NVSDK_NGX_Result_Success;)
     {
-        MakeModelWritable(passOutput);
-        bool evaluated = false;
-        modelFrame.color = passInput;
-        modelFrame.output = passOutput;
-        result = static_cast<int>(nr.models[pass].Run(cmdList, device, modelFrame, PassSettings(cfg, pass),
-                                                      frame.SubmissionEpoch, &evaluated));
-        modelRunning = evaluated && result == NVSDK_NGX_Result_Success;
-        if (!evaluated || result != NVSDK_NGX_Result_Success)
-            break;
+        if (const auto run = pass == 0 ? 0 : DlssNr::Profiles::ReapplyRun(cfg, pass, effectivePasses))
+        {
+            // passInput and finalAnswer are the last network pass's input and answer, both still intact; the
+            // target is the other ping-pong texture, so the dispatch never writes what it reads.
+            auto* reapplied = finalAnswer == nr.output ? nr.passScratch : nr.output;
+            MakeModelWritable(reapplied);
+            DlssNrConstants reapply {};
+            reapply.Mode = DlssNrMode_Reapply;
+            reapply.WhitePoint = float(run) * DlssNr::Profiles::ReapplyGain(cfg);
+            reapply.Width = modelWidth;
+            reapply.Height = modelHeight;
+            if (!shader.DispatchPass(cmdList, reapply, passInput, finalAnswer, nullptr, nullptr, nullptr, reapplied,
+                                     nullptr))
+            {
+                ReportSkipOnce("the re-apply dispatch failed; using the last model answer");
+                effectivePasses = pass;
+                break;
+            }
+            finalAnswer = reapplied;
+            MakeModelReadable(finalAnswer);
+            pass += run;
+        }
+        else
+        {
+            MakeModelWritable(passOutput);
+            bool evaluated = false;
+            modelFrame.color = passInput;
+            modelFrame.output = passOutput;
+            if (borrowing)
+                NrPassBorrow::BeginEvaluation(evaluation);
+            // Which kernels and weights this pass runs; told where the evaluation ends whatever its outcome.
+            DlssNr::Nvfp4::BeginEvaluation(DlssNr::Profiles::RequestedPreset(cfg, pass));
+            result = static_cast<int>(nr.models[pass].Run(cmdList, device, modelFrame, PassSettings(cfg, pass),
+                                                          frame.SubmissionEpoch, &evaluated));
+            DlssNr::Nvfp4::EndEvaluation(cmdList);
+            // A borrowed part of an evaluation runs no kernels of its own.
+            const bool wholeEvaluation =
+                !borrowing || evaluation >= evaluations || cuts[evaluation] == NrPassBorrow::Cut::None;
+            const auto outcome = borrowing ? NrPassBorrow::EndEvaluation() : NrPassBorrow::Outcome::Native;
+            ++evaluation;
+            modelRunning = evaluated && result == NVSDK_NGX_Result_Success;
+            if (!evaluated || result != NVSDK_NGX_Result_Success)
+                break;
+            if (!DlssNr::Nvfp4::OursRan(wholeEvaluation))
+                nvfp4Rejected = true;
+            if (outcome == NrPassBorrow::Outcome::Dropped)
+            {
+                // The rest of this evaluation's kernels never ran: passOutput is stale and this feature's history is
+                // partial. Keep the previous answer (the other ping-pong texture; never evaluation 0, whose cut is
+                // None) and reset every history next frame. Borrowing stays latched off, so that frame runs natively.
+                ReportSkipOnce("pass borrowing failed mid-evaluation; using the previous pass's answer");
+                clampFailed = true;
+                effectivePasses = pass;
+                break;
+            }
 
-        finalAnswer = passOutput;
-        MakeModelReadable(finalAnswer);
+            finalAnswer = passOutput;
+            MakeModelReadable(finalAnswer);
+            ++pass;
+        }
 
-        if (pass + 1 < effectivePasses)
+        // The next network pass reads the clamped answer; a following re-apply reads this pass's input instead.
+        if (pass < effectivePasses && !DlssNr::Profiles::PassReapplies(cfg, pass))
         {
             MakeModelWritable(nr.passClamp);
             DlssNrConstants clamp {};
             clamp.Mode = DlssNrMode_ClampProxy;
             clamp.Width = modelWidth;
             clamp.Height = modelHeight;
+            // One cached slot per source: re-applied passes break the old pass-parity alternation.
             if (!shader.DispatchPass(cmdList, clamp, finalAnswer, nullptr, nullptr, nullptr, nullptr, nr.passClamp,
-                                     nullptr, &clampSlots[pass % 2]))
+                                     nullptr, &clampSlots[finalAnswer == nr.output ? 0 : 1]))
             {
                 // Keep this frame's last valid answer; later histories skipped a frame.
                 clampFailed = true;
-                effectivePasses = pass + 1;
+                effectivePasses = pass;
                 break;
             }
             MakeModelReadable(nr.passClamp);
             passInput = nr.passClamp;
-            passOutput = passOutput == nr.output ? nr.passScratch : nr.output;
+            passOutput = finalAnswer == nr.output ? nr.passScratch : nr.output;
         }
+    }
+    if (borrowing)
+    {
+        NrPassBorrow::EndFrame();
+        // Log the borrow status whenever it changes, so a log shows whether borrowing engaged.
+        static std::string lastBorrowStatus;
+        char status[160] {};
+        NrPassBorrow::Status(status, sizeof(status));
+        if (lastBorrowStatus != status)
+        {
+            lastBorrowStatus = status;
+            LOG_INFO("DLSS-NR pass borrowing: {}", lastBorrowStatus);
+        }
+    }
+    // A model comparison (Compare with a model as the other side): one pass of the other model on the same input, with
+    // pass 1's settings. Its own feature and history; the picture is put together after the resolve below.
+    const unsigned int compareModel = passConfig ? 0u : DlssNr::Profiles::CompareModel(cfg);
+    auto& compareContext = nr.models[DlssNr::MaxPassCount];
+    ID3D12Resource* compareAnswer = nullptr;
+    const char* compareNote = "";
+    if (compareModel == 0)
+    {
+        compareContext.RetryAfterFailure();
+        ParkNrResource(nr.compareAnswer);
+        ParkNrResource(nr.compareColor);
+    }
+    else if (spatial || borrowing)
+        compareNote = "not with peripheral compression or pass borrowing";
+    else if (result != NVSDK_NGX_Result_Success || finalAnswer == nullptr)
+        compareNote = "the picture's own passes did not run";
+    else
+    {
+        if (nr.compareAnswer == nullptr)
+            nr.compareAnswer = CreateScratch(device, nr.output->GetDesc().Format, modelWidth, modelHeight);
+        if (nr.compareAnswer == nullptr)
+            compareNote = "its texture could not be allocated";
+        else
+        {
+            const bool hadFeature = compareContext.HasFeature();
+            bool evaluated = false;
+            modelFrame.color = modelInput;
+            modelFrame.output = nr.compareAnswer;
+            DlssNr::Nvfp4::BeginEvaluation(compareModel);
+            const auto compared =
+                compareContext.Run(cmdList, device, modelFrame, DlssNr::Profiles::CompareSettings(cfg),
+                                   frame.SubmissionEpoch, &evaluated);
+            DlssNr::Nvfp4::EndEvaluation(cmdList);
+            if (!hadFeature && compareContext.HasFeature())
+                NrPassBorrow::Reset();
+            if (compared != NVSDK_NGX_Result_Success)
+                compareNote = "the other model could not be set up or run (Retry tries again)";
+            else if (!evaluated)
+                compareNote = "the other model is being set up";
+            else if (!DlssNr::Nvfp4::OursRan(true))
+                compareNote = "the other model did not run";
+            else
+            {
+                ++evaluation;
+                compareAnswer = nr.compareAnswer;
+                Barrier(cmdList, compareAnswer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            }
+        }
+    }
+    unsigned int compareShown = 0;
+
+    // Buffers pass borrowing no longer uses (a resolution change replaces them) and the 4-bit feed-forward buffers of
+    // picture sizes no longer in use: this frame's command list and earlier ones may still refer to them, so they are
+    // freed only once the GPU has finished everything recorded so far.
+    {
+        ID3D12Object* retired[16];
+        for (unsigned count; (count = NrPassBorrow::TakeRetired(retired, 16)) != 0;)
+            for (unsigned i = 0; i < count; ++i)
+                lifetime.Retire([object = retired[i]] { object->Release(); });
+        if (const auto ticket = DlssNr::Nvfp4::RetireIdle(device, evaluation))
+            lifetime.Retire([device, ticket] { DlssNr::Nvfp4::FreeRetired(device, ticket); });
     }
 
     ngxTime->End(cmdList);
@@ -567,6 +1024,15 @@ auto DlssNr_Dx12::State::Run(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
     }
 
     nr.reset = clampFailed || finalAnswer == nullptr;
+    if (nvfp4Rejected)
+    {
+        // The answer is, at least in part, the runtime's own model's. It is not shown: the picture stays unprocessed
+        // and the histories start again, so the first frame our kernels do run starts clean.
+        ReportSkipOnce("a pass asked for a 4-bit model that did not run; there is no fallback to the original model");
+        finalAnswer = nullptr;
+        nr.reset = true;
+        modelRunning = false;
+    }
     bool spatialUnpacked = false;
     ID3D12Resource* ordinaryProxy = modelInput;
     ID3D12Resource* ordinaryAnswer = finalAnswer;
@@ -712,6 +1178,8 @@ auto DlssNr_Dx12::State::Run(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
         }
 
         // Resolve pre-SR inputs without UAV support through an owned scratch and copy-back.
+        if (passConfig && resolveParams.Transfer == 1 && !superDownOk && workScale < 1.0f)
+            resolveParams.Mode = DlssNrMode_RawResidual;
         ID3D12Resource* resolveOriginal = targetSupportsUav ? nr.hdrCopy : target;
         ID3D12Resource* resolveTarget = targetSupportsUav ? target : nr.hdrCopy;
 
@@ -723,6 +1191,29 @@ auto DlssNr_Dx12::State::Run(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
         {
             Barrier(cmdList, nr.hdrCopy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+
+        // The comparison's picture: the same resolve from the other model's answer with the sides exchanged, so the
+        // other model's picture lies where the main resolve shows the original one. That part is copied over below.
+        bool compareResolved = false;
+        if (compareAnswer != nullptr)
+        {
+            if (!enlargementReady || superDownOk || resolveProxy != ordinaryProxy || resolveAnswer != ordinaryAnswer ||
+                resolveParams.DebugView != 0 || resolveParams.CompareMode == 0)
+                compareNote = "not with a debug view, supersampling or DLSS enlargement";
+            else
+            {
+                if (nr.compareColor == nullptr)
+                    nr.compareColor = CreateScratch(device, desc.Format, width, height);
+                auto compareParams = resolveParams;
+                compareParams.CompareSwap ^= 1u;
+                compareResolved = nr.compareColor != nullptr &&
+                                  shader.DispatchPass(cmdList, compareParams, resolveProxy, compareAnswer,
+                                                      resolveOriginal, encoded.exposure, nullptr, nr.compareColor,
+                                                      nullptr);
+                if (!compareResolved)
+                    compareNote = "its picture could not be made";
+            }
         }
 
         const bool resolved =
@@ -751,6 +1242,35 @@ auto DlssNr_Dx12::State::Run(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
 
+        if (compareResolved && resolved)
+        {
+            // The shader's own rule: the original picture is where (x + 0.5) / width < split, unless swapped.
+            const float split =
+                resolveParams.CompareMode == 1 ? 0.5f : std::clamp(resolveParams.CompareSplit, 0.0f, 1.0f);
+            const auto boundary =
+                (unsigned int) std::clamp(std::ceil(split * (float) width - 0.5f), 0.0f, (float) width);
+            const bool otherOnLeft = resolveParams.CompareSwap == 0;
+            D3D12_BOX box { otherOnLeft ? 0u : boundary, 0u, 0u, otherOnLeft ? boundary : (unsigned int) width,
+                            (unsigned int) height, 1u };
+            if (box.right > box.left)
+            {
+                D3D12_TEXTURE_COPY_LOCATION from {}, to {};
+                from.pResource = nr.compareColor;
+                from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                to.pResource = target;
+                to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                Barrier(cmdList, nr.compareColor, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+                const D3D12_RESOURCE_STATES priorTargetState = targetState;
+                TransitionTarget(D3D12_RESOURCE_STATE_COPY_DEST);
+                cmdList->CopyTextureRegion(&to, box.left, 0, 0, &from, &box);
+                TransitionTarget(priorTargetState);
+                Barrier(cmdList, nr.compareColor, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
+            compareShown = compareModel;
+        }
+
         if (superDownOk)
         {
             if (spatial)
@@ -770,6 +1290,8 @@ auto DlssNr_Dx12::State::Run(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
             captureFrames.record(cmdList, device, nr.colorCopy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, target,
                                  targetState);
         }
+        if (!passConfig)
+            DlssNr::Calibrate::Composed();
     }
     else if (result != NVSDK_NGX_Result_Success)
     {
@@ -792,6 +1314,24 @@ auto DlssNr_Dx12::State::Run(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
                       NgxResultName((unsigned int) result));
         }
     }
+
+    if (!passConfig)
+    {
+        const char* note = compareModel != 0 && compareShown == 0 ? compareNote : "";
+        if (compareShown != DlssNr::Nvfp4::ComparisonShown() || DlssNr::Nvfp4::ComparisonNote() != note)
+        {
+            if (compareShown != 0)
+                LOG_INFO("DLSS-NR model comparison: the other side shows {}", DlssNr::Nvfp4::ModelName(compareShown));
+            else if (compareModel != 0)
+                LOG_INFO("DLSS-NR model comparison: {} is not shown: {}", DlssNr::Nvfp4::ModelName(compareModel), note);
+            else
+                LOG_INFO("DLSS-NR model comparison: off");
+        }
+        DlssNr::Nvfp4::SetComparison(compareShown, note);
+    }
+    if (compareAnswer != nullptr)
+        Barrier(cmdList, compareAnswer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     // Restore all intermediate surfaces to the UAV state expected by the next frame.
     MakeModelWritable(nr.output);

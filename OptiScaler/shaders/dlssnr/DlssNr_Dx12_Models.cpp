@@ -1,18 +1,22 @@
 #include "pch.h"
 #include "DlssNr_Dx12_State.h"
+#include <dlssnr/NrPassBorrow.h>
+#include <dlssnr/NrNvfp4.h>
+#include <dlssnr/PassProfiles.h>
+#include <Util.h>
 
 bool DlssNr_Dx12::State::PrepareRunModels(ID3D12GraphicsCommandList* cmdList, ID3D12Device* device,
                                           const DlssNrFrameInfo& frame, const D3D12_RESOURCE_DESC& desc,
                                           DlssNr::ColorExtent native, DlssNr::ColorExtent work, float workScale,
-                                          unsigned int requestedPasses, bool spatial)
+                                          unsigned int requestedPasses, bool spatial, bool codecOnly)
 {
-    const auto& cfg = *Config::Instance();
+    const auto& cfg = RunConfig();
     const auto width = native.width, height = native.height;
     const auto workWidth = work.width, workHeight = work.height;
     const bool cropColor = frame.BeforeUpscale && (width != desc.Width || height != desc.Height);
     const bool reduced = workWidth != width || workHeight != height;
-    const auto modelFormat = spatial ? DXGI_FORMAT_R16G16B16A16_FLOAT : desc.Format;
-    ReleaseSurfacesIfFormatChanged(modelFormat, desc.Format);
+    const auto modelFormat = spatial || codecOnly ? DXGI_FORMAT_R16G16B16A16_FLOAT : desc.Format;
+    ReleaseSurfacesIfFormatChanged(modelFormat, desc.Format, codecOnly ? modelFormat : desc.Format);
 
     const bool resolutionChanged =
         nr.width != width || nr.height != height || nr.workWidth != workWidth || nr.workHeight != workHeight;
@@ -46,6 +50,8 @@ bool DlssNr_Dx12::State::PrepareRunModels(ID3D12GraphicsCommandList* cmdList, ID
             ParkNrResource(nr.motionSmall);
             ParkNrResource(nr.outputNative);
             ParkNrResource(nr.activeColor);
+            ParkNrResource(nr.compareAnswer);
+            ParkNrResource(nr.compareColor);
             nr.passScratchFailed = false;
         }
     }
@@ -53,7 +59,7 @@ bool DlssNr_Dx12::State::PrepareRunModels(ID3D12GraphicsCommandList* cmdList, ID
     if (nr.output == nullptr)
     {
         nr.output = CreateScratch(device, modelFormat, workWidth, workHeight);
-        nr.colorCopy = CreateScratch(device, desc.Format, width, height);
+        nr.colorCopy = CreateScratch(device, codecOnly ? modelFormat : desc.Format, width, height);
         nr.hdrCopy = CreateScratch(device, desc.Format, width, height);
         nr.workWidth = workWidth;
         nr.workHeight = workHeight;
@@ -138,17 +144,32 @@ bool DlssNr_Dx12::State::PrepareRunModels(ID3D12GraphicsCommandList* cmdList, ID
 
     // Prepare at most one missing layer per submission. Repeated CPU calls in the same epoch
     // cannot evaluate creation work or create another layer before the first one is submitted.
-    for (unsigned int pass = requestedPasses; pass < DlssNr::MaxPassCount; ++pass)
+    if (codecOnly)
     {
+        for (auto& model : nr.models)
+            model.RetryAfterFailure();
+        return !nr.passScratchFailed;
+    }
+    // A re-applying pass runs no network, so it has no feature (but keeps the ping-pong textures above).
+    for (unsigned int pass = 1; pass < DlssNr::MaxPassCount; ++pass)
+    {
+        if (pass < requestedPasses && !DlssNr::Profiles::PassReapplies(cfg, pass))
+            continue;
         nr.models[pass].RetryAfterFailure();
         nr.passCreateFailed[pass] = false;
     }
     const unsigned int buildPasses = nr.passScratch ? requestedPasses : 1;
+    // The 4-bit kernels are loaded before the feature whose launches they replace is created.
+    DlssNr::Nvfp4::Configure(DlssNr::Profiles::WantsNvfp4(cfg, buildPasses),
+                             Util::DllPath().parent_path() / L"OptiScaler" / L"nvfp4");
     for (unsigned int pass = 0; pass < buildPasses; ++pass)
     {
+        if (DlssNr::Profiles::PassReapplies(cfg, pass))
+            continue;
         if (nr.passCreateFailed[pass])
             break;
         bool ready = false;
+        const bool hadFeature = nr.models[pass].HasFeature();
         const auto prepared = nr.models[pass].Prepare(cmdList, device, workWidth, workHeight, PassSettings(cfg, pass),
                                                       frame.SubmissionEpoch, &ready);
         if (prepared != NVSDK_NGX_Result_Success)
@@ -178,6 +199,8 @@ bool DlssNr_Dx12::State::PrepareRunModels(ID3D12GraphicsCommandList* cmdList, ID
             return false;
         }
         nr.builtSettings[pass] = PassSettings(cfg, pass);
+        if (!hadFeature && nr.models[pass].HasFeature())
+            NrPassBorrow::Reset(); // A new feature has new kernels and tensors; record the template again.
         if (!ready)
             return false;
     }
@@ -238,7 +261,7 @@ auto DlssNr_Dx12::State::TuningMatchesFeature(const Config& cfg, unsigned int re
     {
         // A profile cannot be stale until its feature exists. This lets a user prepare pass 2 or 3
         // while running fewer layers without needlessly rebuilding pass 1.
-        if (!nr.models[pass].HasFeature())
+        if (!nr.models[pass].HasFeature() || DlssNr::Profiles::PassReapplies(cfg, pass))
             continue;
 
         if (nr.builtSettings[pass] != PassSettings(cfg, pass))
