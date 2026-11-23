@@ -16,6 +16,7 @@
 #include <misc/FrameLimit.h>
 
 #include <misc/IdentifyGpu.h>
+#include <misc/LifecycleAdapterV1.h>
 #include <hooks/Reflex_Hooks.h>
 #include <menu/menu_overlay_dx.h>
 
@@ -1219,14 +1220,25 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
         }
     }
 
+    // Loading can continue presenting without another Evaluate. Serialize the actual FG deactivation
+    // before the active-state snapshot and Reflex/FG markers, even when the optional present mutex is off.
+    const bool frameGenerationPaused = state.activeFgOutput == FGOutput::DLSSG && LifecycleAdapterV1::FrameGenerationPaused();
     bool mutexUsed = false;
-    if (willPresent && fg != nullptr && fg->IsActive() && !fg->IsPaused() &&
-        config->FGUseMutexForSwapchain.value_or_default() && fg->Mutex.getOwner() != 2)
+    if (willPresent && fg != nullptr && fg->IsActive() &&
+        (frameGenerationPaused || (!fg->IsPaused() && config->FGUseMutexForSwapchain.value_or_default())) &&
+        fg->Mutex.getOwner() != 2)
     {
         LOG_TRACE("Waiting FG->Mutex 2, current: {}", fg->Mutex.getOwner());
         fg->Mutex.lock(2);
         mutexUsed = true;
         LOG_TRACE("Accuired FG->Mutex: {}", fg->Mutex.getOwner());
+    }
+
+    if (willPresent && frameGenerationPaused && fg != nullptr && fg->IsActive())
+    {
+        fg->Deactivate();
+        state.clearCapturedHudlesses = true;
+        LOG_INFO("Lifecycle adapter paused frame generation");
     }
 
     const bool fgFeatureActive = fg != nullptr && fg->IsActive() && !fg->IsPaused();
@@ -1247,7 +1259,10 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
                 tokenResult = StreamlineProxy::GetNewFrameToken()(localToken, &frameId);
 
                 if (tokenResult == sl::Result::eOk)
+                {
+                    ScopedOptiScalerReflex optiScalerCall {};
                     StreamlineProxy::PCLSetMarker()(sl::PCLMarker::ePresentStart, *localToken);
+                }
             }
         }
     }
@@ -1333,10 +1348,36 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
             Util::GetDeviceRemovedReason(state.currentD3D12Device);
     }
 
+    if (willPresent && state.activeFgOutput == FGOutput::DLSSG && fg != nullptr)
+    {
+        // Query on the presenting thread; the menu only reads this snapshot.
+        sl::DLSSGState dlssgState {};
+        const auto stateResult = StreamlineProxy::DLSSGGetState()(sl::ViewportHandle { 0 }, dlssgState, nullptr);
+        if (state.activeFgInput == FGInput::Upscaler)
+            state.dlssgFrameRates.Record(Util::MillisecondsNow(), This, fgFeatureActive,
+                                        stateResult == sl::Result::eOk && result == S_OK,
+                                        dlssgState.numFramesActuallyPresented);
+        if (stateResult == sl::Result::eOk)
+        {
+            const auto status = static_cast<uint32_t>(dlssgState.status);
+            const auto previousStatus = state.dlssgRuntimeStatus.exchange(status);
+            const auto previousCount = state.dlssgPresentedSinceLastPoll.exchange(
+                static_cast<int>(dlssgState.numFramesActuallyPresented));
+            if (previousCount < 0 || previousStatus != status)
+                LOG_INFO("DLSSG runtime status: {:X}, presented since last poll: {}", status,
+                         dlssgState.numFramesActuallyPresented);
+        }
+        else if (state.dlssgPresentedSinceLastPoll.exchange(-1) >= 0)
+        {
+            LOG_WARN("Couldn't query DLSSG state, error: {}", magic_enum::enum_name(stateResult));
+        }
+    }
+
     if (tokenResult == sl::Result::eOk && localToken != nullptr && fgFeatureActive &&
         (!ReflexHooks::gameIsSendingMarkers() || !config->FGDLSSGUseGamesReflexMarkers.value_or_default()) &&
         willPresent && state.activeFgOutput == FGOutput::DLSSG)
     {
+        ScopedOptiScalerReflex optiScalerCall {};
         if (StreamlineProxy::PCLSetMarker() != nullptr)
             StreamlineProxy::PCLSetMarker()(sl::PCLMarker::ePresentEnd, *localToken);
 

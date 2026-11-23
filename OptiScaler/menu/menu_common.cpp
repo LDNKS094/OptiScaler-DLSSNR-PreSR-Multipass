@@ -2009,7 +2009,24 @@ void MenuCommon::RenderPerformanceOverlay(RenderMenuContext& ctx)
             }
             else if (state.activeFgOutput == FGOutput::DLSSG && fg)
             {
-                fgText = formatFg("DLSSG", fg->GetMaxInterpolationCount());
+                if (state.activeFgInput == FGInput::Upscaler)
+                {
+                    // The upscaler output uses Streamline, not the NGX FG input counter.
+                    const auto presented = state.dlssgPresentedSinceLastPoll.load();
+                    const auto runtimeStatus = state.dlssgRuntimeStatus.load();
+                    if (!config->FGEnabled.value_or_default())
+                        fgText = " (DLSSG off)";
+                    else if (!fg->IsActive() || fg->IsPaused())
+                        fgText = " (DLSSG waiting)";
+                    else if (presented < 0)
+                        fgText = " (DLSSG unknown)";
+                    else if (runtimeStatus != 0)
+                        fgText = std::format(" (DLSSG error 0x{:X})", runtimeStatus);
+                    else
+                        fgText = " (DLSSG on, runtime ready)";
+                }
+                else
+                    fgText = formatFg("DLSSG", fg->GetMaxInterpolationCount());
             }
 
             const auto overlayType = config->FpsOverlayType.value_or_default();
@@ -2029,7 +2046,15 @@ void MenuCommon::RenderPerformanceOverlay(RenderMenuContext& ctx)
                                      usesDx12CompatLayer ? " w/Dx12" : "");
             }
 
-            if (fg != nullptr && fg->IsActive() && !fg->IsPaused())
+            if (state.activeFgInput == FGInput::Upscaler && state.activeFgOutput == FGOutput::DLSSG && fg)
+            {
+                const auto rates = state.dlssgFrameRates.Read();
+                if (rates.app < 0 || rates.presented < 0)
+                    fpsPart = "SL presented FPS: -- | App FPS: --";
+                else
+                    fpsPart = StrFmt("SL presented FPS: %6.1f | App FPS: %6.1f", rates.presented, rates.app);
+            }
+            else if (fg != nullptr && fg->IsActive() && !fg->IsPaused())
             {
                 const double baseFps = frameRate / (double) (fg->GetInterpolatedFrameCount() + 1);
 
@@ -4395,20 +4420,40 @@ void MenuCommon::RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx)
 
         ImGui::Text("Current DLSSG state:");
         ImGui::SameLine();
-        if (auto count = state.dlssgDetectedInterpolationCount; count > 0)
+        const auto presented = state.dlssgPresentedSinceLastPoll.load();
+        const auto runtimeStatus = state.dlssgRuntimeStatus.load();
+        if (!config->FGEnabled.value_or_default())
         {
-            ImGui::TextColored(toneMapColor(ImVec4(0.f, 1.f, 0.25f, 1.f)), std::format("ON {}x", count + 1).c_str());
+            ImGui::TextColored(toneMapColor(ImVec4(1.f, 0.f, 0.f, 1.f)), "OFF");
+        }
+        else if (!fgOutput->IsActive() || fgOutput->IsPaused())
+        {
+            ImGui::TextUnformatted("WAITING");
+        }
+        else if (presented < 0)
+        {
+            ImGui::TextUnformatted("UNKNOWN");
+        }
+        else if (runtimeStatus != 0)
+        {
+            ImGui::TextColored(toneMapColor(ImVec4(1.f, 0.f, 0.f, 1.f)), "ERROR 0x%X", runtimeStatus);
         }
         else
         {
-            ImGui::TextColored(toneMapColor(ImVec4(1.f, 0.f, 0.f, 1.f)), "OFF");
+            ImGui::TextColored(toneMapColor(ImVec4(0.f, 1.f, 0.25f, 1.f)), "ON (runtime ready)");
+        }
+        if (presented >= 0)
+        {
+            ImGui::Text("Presented since last poll: %d", presented);
+            ShowHelpMarker("Frames reported by Streamline since the previous query, including rendered frames. "
+                           "This is not the requested FG multiplier or an FPS measurement.");
         }
 
         bool fgActive = config->FGEnabled.value_or_default();
         if (ImGui::Checkbox("Active##4", &fgActive))
         {
             config->FGEnabled = fgActive;
-            LOG_DEBUG("Enabled set FGEnabled: {}", fgActive);
+            LOG_INFO("Enabled set FGEnabled: {}", fgActive);
 
             if (config->FGEnabled.value_or_default())
                 state.fgChanged = true;

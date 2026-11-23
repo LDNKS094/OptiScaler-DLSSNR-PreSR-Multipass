@@ -764,10 +764,25 @@ class NVNGXProxy
         return _module.D3D11_Shutdown;
     }
 
+    static NVSDK_NGX_Result D3D11CoreShutdown1(ID3D11Device* InDevice)
+    {
+        // The driver core export writes a DWORD through its second argument.
+        // Keep the public SDK's single-argument signature at the proxy boundary.
+        using CoreShutdown1 = NVSDK_NGX_Result (*)(ID3D11Device*, unsigned int*);
+        unsigned int output = 0;
+        auto result = reinterpret_cast<CoreShutdown1>(_module.D3D11_Shutdown1)(InDevice, &output);
+        LOG_INFO("Driver core D3D11 Shutdown1 returned: {:X}, output: {}", (UINT) result, output);
+        return result;
+    }
+
     static PFN_D3D11_Shutdown1 D3D11_Shutdown1()
     {
         if (!_dx11Inited)
             return nullptr;
+
+        if (_module.D3D11_Shutdown1 != nullptr &&
+            _wcsicmp(std::filesystem::path(_module.filePath).filename().c_str(), L"_nvngx.dll") == 0)
+            return D3D11CoreShutdown1;
 
         return _module.D3D11_Shutdown1;
     }

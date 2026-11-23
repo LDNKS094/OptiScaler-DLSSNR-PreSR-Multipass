@@ -12,6 +12,7 @@
 #include <mutex>
 #include <atomic>
 #include <sl_dlss_g.h>
+#include <framegen/dlssg/DlssgFrameRates.h>
 #include <vulkan/vulkan.h>
 #include <ankerl/unordered_dense.h>
 
@@ -265,6 +266,9 @@ class State
     bool dlssgGameDMFGSupported = false;
     sl::DLSSGMode dlssgLastSetMode = sl::DLSSGMode::eOff;
     int dlssgDetectedInterpolationCount = 0;
+    std::atomic<int> dlssgPresentedSinceLastPoll { -1 };
+    std::atomic<uint32_t> dlssgRuntimeStatus { 0 };
+    DlssgFrameRates dlssgFrameRates;
 
     // DLSS
     bool dlssPresetsOverriddenExternally = false;

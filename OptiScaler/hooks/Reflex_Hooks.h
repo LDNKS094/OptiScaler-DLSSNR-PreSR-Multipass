@@ -5,6 +5,18 @@
 #include "Hook_Utils.h"
 #include "low_latency/ll_util.h"
 
+class ScopedOptiScalerReflex
+{
+    inline static thread_local unsigned int _depth = 0;
+
+  public:
+    ScopedOptiScalerReflex() { ++_depth; }
+    ~ScopedOptiScalerReflex() { --_depth; }
+    ScopedOptiScalerReflex(const ScopedOptiScalerReflex&) = delete;
+    ScopedOptiScalerReflex& operator=(const ScopedOptiScalerReflex&) = delete;
+    static bool IsActive() { return _depth != 0; }
+};
+
 enum TimingType : uint32_t
 {
     TimeRange, // in ns, value stored in length

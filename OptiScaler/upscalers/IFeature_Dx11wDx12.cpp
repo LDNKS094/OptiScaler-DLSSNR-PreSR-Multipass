@@ -8,6 +8,7 @@
 #include <proxies/DXGI_Proxy.h>
 #include <proxies/D3D12_Proxy.h>
 #include <misc/IdentifyGpu.h>
+#include <dlssnr/DlssNrFeature_Dx12.h>
 
 #include <with_dx12/with_dx12.h>
 
@@ -103,6 +104,79 @@ void IFeature_Dx11wDx12::ReleaseSharedResources()
     }
 
     // SAFE_RELEASE(Dx12Device);
+}
+
+bool IFeature_Dx11wDx12::WaitForGpuIdle()
+{
+    if (Dx12Fence == nullptr || Dx12FenceEvent == nullptr)
+    {
+        LOG_ERROR("Release: bridge fence is unavailable after command resource creation failed");
+        return false;
+    }
+
+    // Retirement may precede Present. Submit the D3D11 signals the bridge queue is waiting on.
+    if (auto* context = Dx11WithDx12::GetD3D11DeviceContext())
+        context->Flush();
+
+    const auto value = ++Dx12FenceValue;
+    auto result = Dx12CommandQueue->Signal(Dx12Fence, value);
+    if (FAILED(result))
+    {
+        LOG_ERROR("Release: queue Signal failed: {:X}", (UINT) result);
+        return false;
+    }
+    const auto completed = Dx12Fence->GetCompletedValue();
+    if (completed == UINT64_MAX)
+    {
+        LOG_ERROR("Release: device removed while waiting for GPU work");
+        return false;
+    }
+    if (completed < value)
+    {
+        result = Dx12Fence->SetEventOnCompletion(value, Dx12FenceEvent);
+        if (FAILED(result))
+        {
+            LOG_ERROR("Release: SetEventOnCompletion failed: {:X}", (UINT) result);
+            return false;
+        }
+        const auto waited = WaitForSingleObject(Dx12FenceEvent, INFINITE);
+        if (waited != WAIT_OBJECT_0)
+        {
+            LOG_ERROR("Release: fence wait failed: {:X}, Windows error: {}", (UINT) waited, GetLastError());
+            return false;
+        }
+    }
+    return true;
+}
+
+// Completed lists still retain recorded resource references. After the GPU wait, resetting the real
+// lists and notifying NR lets retired owners release those references before the inner feature is destroyed.
+bool IFeature_Dx11wDx12::ResetCompletedCommandLists()
+{
+    for (size_t i = 0; i < DX11WDX12_COMMAND_BUFFER_COUNT; ++i)
+    {
+        auto result = Dx12CommandAllocator[i]->Reset();
+        if (FAILED(result))
+        {
+            LOG_ERROR("Release: allocator {} Reset failed: {:X}", i, (UINT) result);
+            return false;
+        }
+        result = Dx12CommandList[i]->Reset(Dx12CommandAllocator[i], nullptr);
+        if (FAILED(result))
+        {
+            LOG_ERROR("Release: command list {} Reset failed: {:X}", i, (UINT) result);
+            return false;
+        }
+        DlssNr::FinishedPictureResetCommandList(Dx12CommandList[i]);
+        result = Dx12CommandList[i]->Close();
+        if (FAILED(result))
+        {
+            LOG_ERROR("Release: command list {} Close failed: {:X}", i, (UINT) result);
+            return false;
+        }
+        Dx12CommandAllocatorFenceValue[i] = 0;
+    }
+    return true;
 }
 
 bool IFeature_Dx11wDx12::ProcessDx11Textures(const NVSDK_NGX_Parameter* InParameters)

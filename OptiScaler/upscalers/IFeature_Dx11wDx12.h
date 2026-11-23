@@ -57,6 +57,8 @@ class IFeature_Dx11wDx12 : public virtual IFeature_Dx11
                          D3D12_RESOURCE_STATES InBeforeState, D3D12_RESOURCE_STATES InAfterState);
 
     void ReleaseSharedResources();
+    bool WaitForGpuIdle();
+    bool ResetCompletedCommandLists();
 
     bool BaseInit(ID3D11Device* InDevice, ID3D11DeviceContext* InContext, NVSDK_NGX_Parameter* InParameters);
 

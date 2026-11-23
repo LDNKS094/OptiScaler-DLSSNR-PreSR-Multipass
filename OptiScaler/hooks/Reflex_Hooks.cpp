@@ -28,6 +28,9 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_
     memcpy(&_lastSleepParams, pSetSleepModeParams, sizeof(NV_SET_SLEEP_MODE_PARAMS));
     _lastSleepDev = pDev;
 
+    if (ScopedOptiScalerReflex::IsActive())
+        return o_NvAPI_D3D_SetSleepMode(pDev, pSetSleepModeParams);
+
     if (State::Instance().gameQuirks & GameQuirk::HitmanReflexHacks)
         _lastSetSleepThread = std::this_thread::get_id();
 
@@ -42,35 +45,30 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_
 
 NvAPI_Status ReflexHooks::hkNvAPI_D3D_Sleep(IUnknown* pDev)
 {
+    if (ScopedOptiScalerReflex::IsActive())
+    {
+        _lastSleepDev = pDev;
+        return o_NvAPI_D3D_Sleep(pDev);
+    }
 #ifdef LOG_REFLEX_CALLS
     LOG_FUNC();
 #endif
 
-    static bool skip = false;
     if (State::Instance().activeFgOutput == FGOutput::DLSSG &&
         Config::Instance()->FGDLSSGUseGamesReflexMarkers.value_or_default() && State::Instance().currentFG &&
         State::Instance().currentFG->IsActive() && !State::Instance().currentFG->IsPaused())
     {
-        if (!skip)
-        {
-            uint32_t frameCount = (uint32_t) _lastFrameId[SIMULATION_START] + 1;
+        uint32_t frameCount = (uint32_t) _lastFrameId[SIMULATION_START] + 1;
 
-            sl::FrameToken* frameToken;
-            StreamlineProxy::GetNewFrameToken()(frameToken, &frameCount);
+        sl::FrameToken* frameToken;
+        StreamlineProxy::GetNewFrameToken()(frameToken, &frameCount);
 
-            LOG_TRACE("Sleep for frame {}", frameCount);
+        LOG_TRACE("Sleep for frame {}", frameCount);
 
-            skip = true;
-            StreamlineProxy::ReflexSleep()(*frameToken);
-            skip = false;
+        ScopedOptiScalerReflex optiScalerCall {};
+        StreamlineProxy::ReflexSleep()(*frameToken);
 
-            return NVAPI_OK;
-        }
-        else
-        {
-            _lastSleepDev = pDev;
-            return o_NvAPI_D3D_Sleep(pDev);
-        }
+        return NVAPI_OK;
     }
 
     if (State::Instance().activeFgOutput == FGOutput::XeFG)
@@ -95,6 +93,11 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_GetLatency(IUnknown* pDev, NV_LATENCY_RESU
 NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetLatencyMarker(IUnknown* pDev,
                                                        NV_LATENCY_MARKER_PARAMS* pSetLatencyMarkerParams)
 {
+    if (ScopedOptiScalerReflex::IsActive())
+    {
+        _updatesWithoutMarker = 0;
+        return o_NvAPI_D3D_SetLatencyMarker(pDev, pSetLatencyMarkerParams);
+    }
 #ifdef LOG_REFLEX_CALLS
     LOG_FUNC();
 #endif
@@ -131,8 +134,6 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetLatencyMarker(IUnknown* pDev,
     // if (pSetLatencyMarkerParams->markerType == PRESENT_END)
     _lastFrameId[pSetLatencyMarkerParams->markerType] = pSetLatencyMarkerParams->frameID;
     _lastDev[pSetLatencyMarkerParams->markerType] = pDev;
-
-    static bool skip[20] = {};
 
     if (pSetLatencyMarkerParams->markerType == SIMULATION_START)
         _lastMarkerFrame = State::Instance().fgLastFrame;
@@ -202,9 +203,7 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetLatencyMarker(IUnknown* pDev,
             noMarker = true;
         }
 
-        auto index = (UINT) marker;
-
-        if (!noMarker && !skip[index])
+        if (!noMarker)
         {
             if (pSetLatencyMarkerParams->markerType == PRESENT_START && State::Instance().currentFG != nullptr)
             {
@@ -224,19 +223,12 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetLatencyMarker(IUnknown* pDev,
 
             LOG_TRACE("{} for frame {}", magic_enum::enum_name(marker), frameCount);
 
-            skip[index] = true;
+            ScopedOptiScalerReflex optiScalerCall {};
             StreamlineProxy::PCLSetMarker()(marker, *frameToken);
-            skip[index] = false;
 
             return NvAPI_Status::NVAPI_OK;
         }
-        else
-        {
-            if (noMarker)
-                return NVAPI_OK;
-            else
-                return o_NvAPI_D3D_SetLatencyMarker(pDev, pSetLatencyMarkerParams);
-        }
+        return NVAPI_OK;
     }
 
     if (State::Instance().gameQuirks & GameQuirk::HitmanReflexHacks)
@@ -565,6 +557,16 @@ void ReflexHooks::update(bool fgActive, bool isVulkan)
     _updatesWithoutMarker++;
 
     State::Instance().reflexShowWarning = false;
+
+    const auto& state = State::Instance();
+    if (!isVulkan && fgActive && state.activeFgInput == FGInput::Upscaler &&
+        state.activeFgOutput == FGOutput::DLSSG && state.activeFgNvngx == FGNvngxReplacement::None)
+    {
+        // This output submits its FPS cap through slReflexSetOptions.
+        State::Instance().reflexLimitsFps = _inited && _updatesWithoutMarker <= 20 &&
+                                          _lastSleepDev != nullptr && _lastSleepParams.bLowLatencyMode;
+        return;
+    }
 
     if (_updatesWithoutMarker > 20 || !_inited)
     {

@@ -7,6 +7,8 @@
 #include "State.h"
 #include <dlssnr/DlssNr_Pipeline_Dx12.h>
 
+static std::atomic<unsigned> featureInstances { 0 };
+
 void IFeature_Dx12::ResourceBarrier(ID3D12GraphicsCommandList* InCommandList, ID3D12Resource* InResource,
                                     D3D12_RESOURCE_STATES InBeforeState, D3D12_RESOURCE_STATES InAfterState) const
 {
@@ -426,10 +428,11 @@ void IFeature_Dx12::ReadDetailedGpuTimes(void* commandQueueVoid, std::vector<Det
         detailedGpuTimes.emplace_back(DetailedGpuTime { Magnifier->Name(), magnifierTime.value(), false });
 }
 
-IFeature_Dx12::IFeature_Dx12(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters) {}
+IFeature_Dx12::IFeature_Dx12(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters) { ++featureInstances; }
 
 IFeature_Dx12::~IFeature_Dx12()
 {
+    const auto remainingInstances = --featureInstances;
     if (State::Instance().isShuttingDown)
     {
         // Returning alone still runs unique_ptr destructors under the loader lock.
@@ -442,7 +445,9 @@ IFeature_Dx12::~IFeature_Dx12()
         return;
     }
 
-    Imgui.reset();
+    // DX12 features share ImGui until the last instance is destroyed.
+    if (remainingInstances == 0)
+        Imgui.reset();
     OutputScaler.reset();
     RCAS.reset();
     Bias.reset();

@@ -5,6 +5,7 @@
 
 #include <upscalers/IFeature_Dx11.h>
 #include <upscalers/FeatureProvider_Dx11.h>
+#include <upscalers/dlss/DLSSFeature_Dx11On12.h>
 
 #include "NVNGX_DLSS.h"
 #include "NVNGX_Parameter.h"
@@ -17,10 +18,51 @@
 #include <ankerl/unordered_dense.h>
 #include <imgui/ImGuiNotify.hpp>
 #include <misc/IdentifyGpu.h>
+#include <misc/LifecycleAdapterV1.h>
+#include <unordered_set>
 
 static ID3D11Device* D3D11Device = nullptr;
 // Leftover bridge/GPU owners must not run destructors under the loader lock.
 static auto& Dx11Contexts = *new ankerl::unordered_dense::map<unsigned int, ContextData<IFeature_Dx11>>;
+// Registration enumerates the same contexts that NGX calls mutate. Callbacks can enqueue requests
+// under this lock, and Shutdown1 calls Shutdown, so both paths require recursive entry.
+static std::recursive_mutex contextMutex;
+static OptiScalerLifecycleCallbackV2 lifecycleCallback = nullptr;
+static std::unordered_set<unsigned int> pendingReleases;
+
+static void NotifyLifecycle(uint32_t event, uint32_t handle)
+{
+    if (lifecycleCallback)
+        lifecycleCallback(event, handle);
+}
+
+extern "C" __declspec(dllexport) uint32_t OptiScaler_RegisterReleaseLifecycleV2(OptiScalerLifecycleCallbackV2 callback)
+{
+    std::lock_guard lock(contextMutex);
+    lifecycleCallback = callback;
+    if (callback)
+        for (const auto& [id, context] : Dx11Contexts)
+            callback(OptiScalerLifecycleCreatedV1, id);
+    return 1;
+}
+
+extern "C" __declspec(dllexport) uint32_t OptiScaler_RequestReleaseV2(uint64_t handle)
+{
+    std::lock_guard lock(contextMutex);
+    const auto id = static_cast<unsigned int>(handle);
+    const auto it = Dx11Contexts.find(id);
+    if (it == Dx11Contexts.end() || !dynamic_cast<DLSSFeatureDx11on12*>(it->second.feature.get()) ||
+        !it->second.feature->IsInited())
+        return 0;
+    pendingReleases.insert(id);
+    return 1;
+}
+
+extern "C" __declspec(dllexport) void OptiScaler_SetFrameGenerationPausedV1(bool paused)
+{
+    LifecycleAdapterV1::frameGenerationPaused.store(paused, std::memory_order_release);
+}
+
 static int evalCounter = 0;
 static bool shutdown = false;
 static bool _skipInit = false;
@@ -326,17 +368,23 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_Shutdown()
 {
     if (State::Instance().isShuttingDown)
         return NVSDK_NGX_Result_Success;
+    std::lock_guard lock(contextMutex);
     shutdown = true;
 
     State::Instance().currentFeature = nullptr;
     // DX11-on-DX12 features own their NR shaders through the shared DX12 feature.
+    for (const auto& [id, context] : Dx11Contexts)
+        NotifyLifecycle(OptiScalerLifecycleReleasedV1, id);
     Dx11Contexts.clear();
+    pendingReleases.clear();
     D3D11Device = nullptr;
 
     if (Config::Instance()->DLSSEnabled.value_or_default() && NVNGXProxy::IsDx11Inited() &&
         NVNGXProxy::D3D11_Shutdown() != nullptr)
     {
+        LOG_INFO("Calling driver D3D11 Shutdown, retained contexts: {}", Dx11Contexts.size());
         auto result = NVNGXProxy::D3D11_Shutdown()();
+        LOG_INFO("Driver D3D11 Shutdown returned: {:X}", (UINT) result);
         NVNGXProxy::SetDx11Inited(false);
     }
 
@@ -349,6 +397,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_Shutdown()
 
     UpscalerInputsDx11wDx12::Reset();
     Dx11WithDx12::ResetUpscalerResourceCache(true);
+    LOG_INFO("D3D11 NGX shutdown cleanup complete");
 
     return NVSDK_NGX_Result_Success;
 }
@@ -357,14 +406,20 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_Shutdown1(ID3D11Device* InDevice)
 {
     if (State::Instance().isShuttingDown)
         return NVSDK_NGX_Result_Success;
+    std::lock_guard lock(contextMutex);
     shutdown = true;
     State::Instance().currentFeature = nullptr;
+    for (const auto& [id, context] : Dx11Contexts)
+        NotifyLifecycle(OptiScalerLifecycleReleasedV1, id);
     Dx11Contexts.clear();
+    pendingReleases.clear();
 
     if (Config::Instance()->DLSSEnabled.value_or_default() && NVNGXProxy::IsDx11Inited() &&
         NVNGXProxy::D3D11_Shutdown1() != nullptr)
     {
+        LOG_INFO("Calling driver D3D11 Shutdown1, retained contexts: {}", Dx11Contexts.size());
         auto result = NVNGXProxy::D3D11_Shutdown1()(InDevice);
+        LOG_INFO("Driver D3D11 Shutdown1 returned: {:X}", (UINT) result);
         NVNGXProxy::SetDx11Inited(false);
     }
 
@@ -527,6 +582,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext
                                                              NVSDK_NGX_Parameter* InParameters,
                                                              NVSDK_NGX_Handle** OutHandle)
 {
+    std::lock_guard lock(contextMutex);
     // FeatureId check
     if (InFeatureID != NVSDK_NGX_Feature_SuperSampling && InFeatureID != NVSDK_NGX_Feature_RayReconstruction)
     {
@@ -603,6 +659,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext
 
     if (deviceContext->ModuleLoaded() && deviceContext->Init(D3D11Device, InDevCtx, InParameters))
     {
+        NotifyLifecycle(OptiScalerLifecycleCreatedV1, handleId);
         State::Instance().currentFeature = deviceContext;
         UpscalerInputsDx11wDx12::Reset();
         return NVSDK_NGX_Result_Success;
@@ -612,8 +669,44 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext
 
     State::Instance().newBackend = Upscaler::FSR22;
     State::Instance().changeBackend[handleId] = true;
+    NotifyLifecycle(OptiScalerLifecycleCreatedV1, handleId);
 
     return NVSDK_NGX_Result_Success;
+}
+
+static void RemoveModFeature(unsigned int handleId)
+{
+    const auto it = Dx11Contexts.find(handleId);
+    if (it->second.feature.get() == State::Instance().currentFeature)
+        State::Instance().currentFeature = nullptr;
+    Dx11Contexts.erase(it);
+    pendingReleases.erase(handleId);
+    NotifyLifecycle(OptiScalerLifecycleReleasedV1, handleId);
+}
+
+static void ApplyReleaseRequests(unsigned int currentHandle)
+{
+    auto releases = std::move(pendingReleases);
+    pendingReleases.clear();
+    for (const auto id : releases)
+    {
+        if (id == currentHandle)
+            continue;
+        const auto it = Dx11Contexts.find(id);
+        if (it == Dx11Contexts.end())
+            continue;
+        // The new scene owns the current FG inputs. Drain and remove only the old bridge.
+        auto* bridge = dynamic_cast<DLSSFeatureDx11on12*>(it->second.feature.get());
+        if (bridge && bridge->IsInited() && bridge->PrepareForRelease())
+        {
+            LOG_INFO("Feature lifecycle: released handle {}", id);
+            RemoveModFeature(id);
+        }
+        else
+        {
+            LOG_ERROR("Feature lifecycle: failed to release handle {}", id);
+        }
+    }
 }
 
 NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_ReleaseFeature(NVSDK_NGX_Handle* InHandle)
@@ -622,6 +715,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_ReleaseFeature(NVSDK_NGX_Handle* 
         return NVSDK_NGX_Result_Success;
     if (!InHandle)
         return NVSDK_NGX_Result_Success;
+    std::lock_guard lock(contextMutex);
 
     auto handleId = InHandle->Id;
     if (handleId < DLSS_MOD_ID_OFFSET)
@@ -641,32 +735,39 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_ReleaseFeature(NVSDK_NGX_Handle* 
         }
     }
 
-    if (State::Instance().currentFG != nullptr && State::Instance().activeFgInput == FGInput::Upscaler)
+    const auto context = Dx11Contexts.find(handleId);
+    if (context == Dx11Contexts.end())
+        return NVSDK_NGX_Result_Success;
+
+    auto* feature = context->second.feature.get();
+    auto* bridge = dynamic_cast<DLSSFeatureDx11on12*>(feature);
+    const bool retireBridge = bridge != nullptr && bridge->IsInited();
+    if (retireBridge && !bridge->PrepareForRelease())
+        return NVSDK_NGX_Result_Fail;
+
+    auto& state = State::Instance();
+    // An old bridge does not own the shared inputs of the selected upscaler.
+    if ((!retireBridge || feature == state.currentFeature) && state.currentFG != nullptr &&
+        state.activeFgInput == FGInput::Upscaler)
     {
-        State::Instance().fgChanged = true;
-        State::Instance().currentFG->DestroyFGContext();
-        State::Instance().clearCapturedHudlesses = true;
+        state.fgChanged = true;
+        state.currentFG->DestroyFGContext();
+        state.clearCapturedHudlesses = true;
         UpscalerInputsDx11wDx12::Reset();
     }
 
     if (!shutdown)
         LOG_INFO("releasing feature with id {0}", handleId);
 
-    if (auto deviceContext = Dx11Contexts[handleId].feature.get(); deviceContext != nullptr)
+    if (feature != nullptr)
     {
-        if (!shutdown)
+        if (!retireBridge && !shutdown)
         {
             LOG_TRACE("sleeping for 500ms before reset()!");
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
 
-        if (deviceContext == State::Instance().currentFeature)
-            State::Instance().currentFeature = nullptr;
-
-        Dx11Contexts[handleId].feature.reset();
-        auto it = std::find_if(Dx11Contexts.begin(), Dx11Contexts.end(),
-                               [&handleId](const auto& p) { return p.first == handleId; });
-        Dx11Contexts.erase(it);
+        RemoveModFeature(handleId);
 
         if (!shutdown && Config::Instance()->Dx11DelayedInit.value_or_default())
         {
@@ -718,6 +819,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceConte
                                                                NVSDK_NGX_Parameter* InParameters,
                                                                PFN_NVSDK_NGX_ProgressCallback InCallback)
 {
+    std::lock_guard lock(contextMutex);
     if (InFeatureHandle == nullptr)
     {
         LOG_DEBUG("InFeatureHandle is null");
@@ -759,7 +861,13 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceConte
         LOG_INFO("callback exist");
 
     IFeature_Dx11* deviceContext = nullptr;
-    auto activeContext = &Dx11Contexts[handleId];
+    const auto context = Dx11Contexts.find(handleId);
+    if (context == Dx11Contexts.end())
+    {
+        LOG_DEBUG("trying to use released handle, returning NVSDK_NGX_Result_Success");
+        return NVSDK_NGX_Result_Success;
+    }
+    auto activeContext = &context->second;
 
     if (state.changeBackend[handleId])
     {
@@ -824,6 +932,13 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceConte
 
     if (suppressDx11HudfixTracking)
         Hudfix_Dx11::SetSkipStatus(false);
+
+    if (upscaleResult)
+    {
+        NotifyLifecycle(OptiScalerLifecycleEvaluatedV1, handleId);
+        if (!pendingReleases.empty())
+            ApplyReleaseRequests(handleId);
+    }
 
     auto upscaler = deviceContext->GetUpscalerType();
     if (!upscaleResult && !deviceContext->IsInited() &&

@@ -19,6 +19,7 @@
 #include <magic_enum.hpp>
 
 #include <DirectXMath.h>
+#include <misc/LifecycleAdapterV1.h>
 
 using namespace DirectX;
 
@@ -291,6 +292,25 @@ void DLSSG_Dx12::Activate()
 
     if (!_isActive)
     {
+        // PresentStart precedes Dispatch, so Reflex must already be enabled on the first active frame.
+        sl::ReflexOptions reflexConst = {};
+        reflexConst.mode = sl::ReflexMode::eLowLatency;
+        reflexConst.useMarkersToOptimize = ReflexHooks::gameIsSendingMarkers();
+
+        if (State::Instance().activeFgInput == FGInput::Upscaler &&
+            State::Instance().activeFgNvngx == FGNvngxReplacement::None)
+        {
+            const auto fpsLimit = Config::Instance()->FramerateLimit.value_or_default();
+            reflexConst.frameLimitUs = fpsLimit > 0.0f ? static_cast<uint32_t>(std::round(1'000'000 / fpsLimit)) : 0;
+        }
+
+        ScopedOptiScalerReflex optiScalerCall {};
+        auto reflexSetOptionsResult = StreamlineProxy::ReflexSetOptions()(reflexConst);
+
+        if (reflexSetOptionsResult != sl::Result::eOk)
+        {
+            LOG_ERROR("Couldn't set Reflex options, error: {}", magic_enum::enum_name(reflexSetOptionsResult));
+        }
 
         UpdateTarget();
         _isActive = true;
@@ -311,6 +331,7 @@ void DLSSG_Dx12::Deactivate()
         sl::ReflexOptions reflexConst = {};
         reflexConst.mode = sl::ReflexMode::eOff;
         reflexConst.useMarkersToOptimize = false;
+        ScopedOptiScalerReflex optiScalerCall {};
         StreamlineProxy::ReflexSetOptions()(reflexConst);
 
         _isActive = false;
@@ -398,6 +419,13 @@ bool DLSSG_Dx12::Dispatch()
     reflexConst.mode = sl::ReflexMode::eLowLatency;
     reflexConst.useMarkersToOptimize = ReflexHooks::gameIsSendingMarkers();
 
+    if (state.activeFgInput == FGInput::Upscaler && state.activeFgNvngx == FGNvngxReplacement::None)
+    {
+        const auto fpsLimit = Config::Instance()->FramerateLimit.value_or_default();
+        reflexConst.frameLimitUs = fpsLimit > 0.0f ? static_cast<uint32_t>(std::round(1'000'000 / fpsLimit)) : 0;
+    }
+
+    ScopedOptiScalerReflex optiScalerCall {};
     auto reflexSetOptionsResult = StreamlineProxy::ReflexSetOptions()(reflexConst);
 
     if (reflexSetOptionsResult != sl::Result::eOk)
@@ -607,7 +635,7 @@ void DLSSG_Dx12::EvaluateState(ID3D12Device* device, FG_Constants& fgConstants)
     _constants = fgConstants;
 
     // If FG Enabled from menu
-    if (Config::Instance()->FGEnabled.value_or_default())
+    if (Config::Instance()->FGEnabled.value_or_default() && !LifecycleAdapterV1::FrameGenerationPaused())
     {
         if (_device == nullptr)
         {
@@ -628,7 +656,9 @@ void DLSSG_Dx12::EvaluateState(ID3D12Device* device, FG_Constants& fgConstants)
     }
     else
     {
-        LOG_DEBUG("!FGEnabled");
+        LOG_DEBUG("FG disabled or adapter pause");
+        if (_isActive && LifecycleAdapterV1::FrameGenerationPaused())
+            LOG_INFO("Lifecycle adapter paused frame generation");
         Deactivate();
 
         state.clearCapturedHudlesses = true;

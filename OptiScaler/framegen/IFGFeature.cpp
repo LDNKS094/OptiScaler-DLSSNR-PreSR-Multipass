@@ -2,6 +2,8 @@
 #include "IFGFeature.h"
 #include <Config.h>
 #include <low_latency/input/input_common.h>
+#include <hooks/Reflex_Hooks.h>
+#include <proxies/Streamline_Proxy.h>
 
 int IFGFeature::GetIndex() { return (_frameCount % BUFFER_COUNT); }
 
@@ -56,6 +58,24 @@ UINT64 IFGFeature::StartNewFrame()
     _noHudless[fIndex] = true;
 
     NewFrame();
+
+    const auto& state = State::Instance();
+    if (state.activeFgInput == FGInput::Upscaler && state.activeFgOutput == FGOutput::DLSSG &&
+        IsActive() && !IsPaused() &&
+        (!ReflexHooks::gameIsSendingMarkers() || !Config::Instance()->FGDLSSGUseGamesReflexMarkers.value_or_default()))
+    {
+        // The upscaler input establishes the frame ID shared by resources and Present markers.
+        const auto frameId = static_cast<uint32_t>(_frameCount);
+        sl::FrameToken* token = nullptr;
+        auto result = StreamlineProxy::GetNewFrameToken()(token, &frameId);
+        if (result == sl::Result::eOk)
+        {
+            ScopedOptiScalerReflex optiScalerCall {};
+            result = StreamlineProxy::PCLSetMarker()(sl::PCLMarker::eSimulationStart, *token);
+        }
+        if (result != sl::Result::eOk)
+            LOG_ERROR("Fallback SimulationStart failed for frame {}: {}", frameId, static_cast<int>(result));
+    }
 
     return _frameCount;
 }
