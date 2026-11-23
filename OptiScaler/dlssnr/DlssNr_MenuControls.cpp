@@ -56,8 +56,9 @@ static void ConstrainSpatialControls(Spatial::Settings& value, float scale)
     const float minimumWork = Spatial::MinimumWorkPercent(scale);
     auto axis = [&](float& center, float& work, float& offset)
     {
-        center = std::clamp(std::isfinite(center) ? center : 80.0f, 1.0f, 99.5f);
-        work = std::clamp(std::isfinite(work) ? work : 90.0f, std::max(minimumWork, center + 0.5f), 100.0f);
+        center = std::clamp(std::isfinite(center) ? center : 80.0f, 1.0f, 100.0f);
+        work = std::clamp(std::isfinite(work) ? work : 90.0f,
+                          std::max(minimumWork, std::min(center + 0.5f, 100.0f)), 100.0f);
         const float limit = Spatial::MaxCenterOffset(center);
         offset = std::clamp(std::isfinite(offset) ? offset : 0.0f, -limit, limit);
     };
@@ -103,11 +104,11 @@ static void RenderSpatial(Config* config)
         if (ImGui::IsItemDeactivatedAfterEdit())
             commit = true;
     };
-    slider("Centre width", pending.centerX, 1.0f, pending.workX - 0.5f);
-    slider("Centre height", pending.centerY, 1.0f, pending.workY - 0.5f);
+    slider("Centre width", pending.centerX, 1.0f, 100.0f);
+    slider("Centre height", pending.centerY, 1.0f, 100.0f);
     const float minimumWork = Spatial::MinimumWorkPercent(scale);
-    slider("Working width", pending.workX, std::max(minimumWork, pending.centerX + 0.5f), 100.0f);
-    slider("Working height", pending.workY, std::max(minimumWork, pending.centerY + 0.5f), 100.0f);
+    slider("Working width", pending.workX, std::max(minimumWork, std::min(pending.centerX + 0.5f, 100.0f)), 100.0f);
+    slider("Working height", pending.workY, std::max(minimumWork, std::min(pending.centerY + 0.5f, 100.0f)), 100.0f);
     const float xLimit = Spatial::MaxCenterOffset(pending.centerX);
     const float yLimit = Spatial::MaxCenterOffset(pending.centerY);
     slider("Centre horizontal offset", pending.offsetX, -xLimit, xLimit);

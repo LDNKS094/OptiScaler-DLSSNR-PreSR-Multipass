@@ -135,7 +135,7 @@ inline Layout Build(const Settings& s, uint32_t nativeW, uint32_t nativeH, float
     const auto validAxis = [](float center, float work, float offset, float shift)
     {
         if (!std::isfinite(center) || !std::isfinite(work) || !std::isfinite(offset) || !std::isfinite(shift) ||
-            center <= 0 || work < 25 || work > 100 || center >= work ||
+            center <= 0 || work < 25 || work > 100 || center > work || (center == work && center != 100) ||
             std::abs(offset) > MaxCenterOffset(center) + 1e-4f)
             return false;
         const auto limits = WorkShiftLimits(center, work, offset);
@@ -150,8 +150,9 @@ inline Layout Build(const Settings& s, uint32_t nativeW, uint32_t nativeH, float
     const uint32_t rawH = EvenExtent(nativeH, s.workY * .01);
     const uint32_t modelW = EvenExtent(nativeW, static_cast<double>(globalScale) * s.workX * .01);
     const uint32_t modelH = EvenExtent(nativeH, static_cast<double>(globalScale) * s.workY * .01);
-    if (modelW < nativeW * .25f || modelH < nativeH * .25f || s.centerX * .01f >= static_cast<float>(rawW) / nativeW ||
-        s.centerY * .01f >= static_cast<float>(rawH) / nativeH)
+    if (modelW < nativeW * .25f || modelH < nativeH * .25f ||
+        (s.centerX != 100 && s.centerX * .01f >= static_cast<float>(rawW) / nativeW) ||
+        (s.centerY != 100 && s.centerY * .01f >= static_cast<float>(rawH) / nativeH))
     {
         result.reason = "effective model extent below 25% or centre outside work";
         return result;
