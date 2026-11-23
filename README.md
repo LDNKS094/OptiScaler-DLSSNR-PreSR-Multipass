@@ -1,3 +1,9 @@
+## DCS World fork
+
+This fork of [OptiScaler NR](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass) is tailored to DCS World for use with DCS Control. DCS World is the only game tested for this fork. Changes aim to preserve compatibility with other games.
+
+The `dcs` branch follows upstream `main`. The `dcs-preview` branch combines the DCS changes with the upstream v0.9.6 preview.
+
 > **v0.8.91 prerelease:** [compressed model input preview](docs/RELEASE-v0.8.91.md).
 
 ## Standalone Display Filter
